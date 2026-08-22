@@ -1,0 +1,78 @@
+import { Router } from 'express';
+import {
+  applyLeave,
+  getMyLeaves,
+  getPendingLeaves,
+  getAllLeaves,
+  getLeaveById,
+  approveLeave,
+  rejectLeave,
+  cancelLeave,
+  getLeaveStats,
+  accrueMonthlyLeaves,
+  getLeaveBalanceHistory,
+  getCompOffBalanceHistory,
+  adjustLeaveBalance,
+} from '../controllers/leave.controller.js';
+import { verifyJWT } from '../middleware/auth.middleware.js';
+import { authorizeRoles } from '../middleware/role.middleware.js';
+
+const router = Router();
+
+// All routes require authentication
+router.use(verifyJWT);
+
+// ── STATS (admin/HR) ──
+router.get(
+  '/stats',
+  authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director'),
+  getLeaveStats
+);
+
+// ── MY LEAVES (any authenticated user) ──
+router.get('/my', getMyLeaves);
+router.get('/history', getLeaveBalanceHistory);
+router.get('/comp-off-history', getCompOffBalanceHistory);
+
+// ── PENDING LEAVES (approvers only) ──
+router.get(
+  '/pending',
+  authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director', 'Manager'),
+  getPendingLeaves
+);
+
+// ── ALL LEAVES (admin view) ──
+router.get(
+  '/all',
+  authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director'),
+  getAllLeaves
+);
+
+// ── APPLY FOR LEAVE ──
+router.post('/apply', applyLeave);
+
+// ── LEAVE BY ID ──
+router.get('/:id', getLeaveById);
+
+// ── APPROVE ──
+router.patch(
+  '/:id/approve',
+  authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director', 'Manager'),
+  approveLeave
+);
+
+// ── REJECT ──
+router.patch(
+  '/:id/reject',
+  authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director', 'Manager'),
+  rejectLeave
+);
+
+// ── CANCEL (owner or admin) ──
+router.patch('/:id/cancel', cancelLeave);
+
+// ── ACCRUAL & ADJUSTMENT (Admin/HR only) ──
+router.post('/accrue-monthly', authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director'), accrueMonthlyLeaves);
+router.post('/adjust-balance', authorizeRoles('SuperUser', 'HR'), adjustLeaveBalance);
+
+export default router;
