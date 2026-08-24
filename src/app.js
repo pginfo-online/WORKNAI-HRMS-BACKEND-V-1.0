@@ -31,6 +31,7 @@ const getAllowedOrigins = () => {
   const origins = [
     'http://localhost:5173',
     'http://localhost:5174',
+    'https://worknai-hrms-frontend-v-1-0.vercel.app',
     'http://localhost:3000',
     'https://worknai-hrms-frontend-v-git-a3837d-pginfoonline-6516s-projects.vercel.app',
     process.env.FRONTEND_URL,
