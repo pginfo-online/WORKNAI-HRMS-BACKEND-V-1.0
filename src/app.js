@@ -32,6 +32,7 @@ const getAllowedOrigins = () => {
     'http://localhost:5173',
     'http://localhost:5174',
     'http://localhost:3000',
+    'https://worknai-hrms-frontend-v-git-a3837d-pginfoonline-6516s-projects.vercel.app',
     process.env.FRONTEND_URL,
     process.env.ADDITIONAL_ALLOWED_ORIGINS,
   ].filter(Boolean);
@@ -96,6 +97,7 @@ const healthCheckHandler = (req, res) => {
 
 app.get('/health', healthCheckHandler);
 app.get('/', healthCheckHandler);
+app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API ROUTES

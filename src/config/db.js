@@ -10,16 +10,14 @@ const connectDB = async () => {
       throw new Error('MONGODB_URI environment variable is not set');
     }
 
+    // Configure public Cloudflare DNS servers for SRV resolution on local networks
     if (dbUri.startsWith('mongodb+srv://') && process.env.NODE_ENV !== 'production') {
       try {
-        dns.setServers(['8.8.8.8', '1.1.1.1']);
-      } catch (dnsErr) {
-        logger.warn(`⚠️ Failed to set fallback DNS servers: ${dnsErr.message}`);
-      }
+        dns.setServers(['1.1.1.1', '1.0.0.1', '8.8.8.8']);
+      } catch (_) {}
     }
 
     const conn = await mongoose.connect(dbUri);
-
     logger.info(`✅ MongoDB connected: ${conn.connection.host}`);
   } catch (error) {
     logger.error(`❌ MongoDB connection failed: ${error.message}`);
