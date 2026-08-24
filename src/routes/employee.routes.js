@@ -1,67 +1,73 @@
 import { Router } from 'express';
-import multer from 'multer';
 import {
   getAllEmployees,
+  getManagementEmployees,
   getNextEmployeeCode,
   getEmployeeById,
+  getMyProfile,
   createEmployee,
   updateEmployee,
+  updateEmployeeDocuments,
+  updateBankDetails,
+  resetEmployeePassword,
   toggleEmployeeStatus,
-  getDepartments,
-  getPositions,
-  getManagementEmployees,
-  updateFaceDescriptor,
-  getUpcomingBirthdays,
-  updateFcmToken,
-  exportEmployeesToExcel,
-  getEmployeeDirectory,
-  getMyProfile,
 } from '../controllers/employee.controller.js';
 import { verifyJWT } from '../middleware/auth.middleware.js';
-import { authorizeRoles, CAN_CREATE_EMPLOYEE, CAN_EDIT_EMPLOYEE } from '../middleware/role.middleware.js';
+import { requireRole, CAN_CREATE_EMPLOYEE, CAN_EDIT_EMPLOYEE, MANAGEMENT_ROLES } from '../middleware/role.middleware.js';
+import { upload } from '../middleware/upload.middleware.js';
 
 const router = Router();
-// Multer: memory storage (buffer → Cloudinary)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
-
-const documentFields = upload.fields([
-  { name: 'profileImage', maxCount: 1 },
-  { name: 'aadhaarFile', maxCount: 1 },
-  { name: 'panFile', maxCount: 1 },
-  { name: 'passbookFile', maxCount: 1 },
-  { name: 'tenthMarksheet', maxCount: 1 },
-  { name: 'twelfthMarksheet', maxCount: 1 },
-  { name: 'graduationMarksheet', maxCount: 1 },
-  { name: 'postGraduationMarksheet', maxCount: 1 },
-  { name: 'medicalDocument', maxCount: 1 },
-  { name: 'experienceCertificate', maxCount: 3 },
-]);
-
 router.use(verifyJWT);
 
-
-// ── New APIs ──────────────────────────────────────────────────────────────────
-router.get('/profile', getMyProfile);               // 1. Profile API (self)
-router.get('/directory', getEmployeeDirectory);     // 2. Employee Directory API
-
-router.get('/next-code', getNextEmployeeCode);
-router.get('/departments', getDepartments);
-router.get('/positions', getPositions);
+// ── LISTING ──
+router.get('/', requireRole([...MANAGEMENT_ROLES, 'Manager']), getAllEmployees);
 router.get('/management', getManagementEmployees);
-router.get('/export/excel', authorizeRoles(...CAN_CREATE_EMPLOYEE), exportEmployeesToExcel);
-router.get('/', authorizeRoles(...CAN_CREATE_EMPLOYEE, 'Manager'), getAllEmployees);
-router.get('/birthdays/upcoming', getUpcomingBirthdays);
-router.put('/profile/face-descriptor', updateFaceDescriptor);
-router.patch('/profile/fcm-token', updateFcmToken);
+router.get('/next-code', requireRole(CAN_CREATE_EMPLOYEE), getNextEmployeeCode);
 
+// ── SELF ──
+router.get('/me', getMyProfile);
+
+// ── BY ID ──
 router.get('/:id', getEmployeeById);
-router.post('/', authorizeRoles(...CAN_CREATE_EMPLOYEE), documentFields, createEmployee);
-router.put('/:id', authorizeRoles(...CAN_EDIT_EMPLOYEE), documentFields, updateEmployee);
-router.patch('/:id/status', authorizeRoles(...CAN_EDIT_EMPLOYEE), toggleEmployeeStatus);
 
+// ── CREATE ──
+router.post('/',
+  requireRole(CAN_CREATE_EMPLOYEE),
+  upload.fields([{ name: 'profileImage', maxCount: 1 }]),
+  createEmployee
+);
 
+// ── UPDATE BASIC INFO ──
+router.put('/:id',
+  requireRole(CAN_EDIT_EMPLOYEE),
+  upload.fields([{ name: 'profileImage', maxCount: 1 }]),
+  updateEmployee
+);
 
+// ── UPDATE DOCUMENTS ──
+router.patch('/:id/documents',
+  requireRole(CAN_EDIT_EMPLOYEE),
+  upload.fields([
+    { name: 'aadhaarFile', maxCount: 1 },
+    { name: 'panFile', maxCount: 1 },
+    { name: 'passbookFile', maxCount: 1 },
+    { name: 'tenthMarksheet', maxCount: 1 },
+    { name: 'twelfthMarksheet', maxCount: 1 },
+    { name: 'graduationMarksheet', maxCount: 1 },
+    { name: 'postGraduationMarksheet', maxCount: 1 },
+    { name: 'medicalDocument', maxCount: 1 },
+    { name: 'experienceCertificate', maxCount: 1 },
+  ]),
+  updateEmployeeDocuments
+);
 
+// ── UPDATE BANK ──
+router.patch('/:id/bank', requireRole(CAN_EDIT_EMPLOYEE), updateBankDetails);
 
+// ── RESET PASSWORD ──
+router.patch('/:id/reset-password', requireRole(MANAGEMENT_ROLES), resetEmployeePassword);
+
+// ── STATUS TOGGLE ──
+router.patch('/:id/status', requireRole([...MANAGEMENT_ROLES]), toggleEmployeeStatus);
 
 export default router;

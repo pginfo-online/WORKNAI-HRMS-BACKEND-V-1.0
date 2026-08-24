@@ -1,12 +1,11 @@
 import { Leave } from '../models/Leave.model.js';
 import { Employee } from '../models/Employee.model.js';
-import { processMonthlyLeaveAccrual } from '../cron/leave.cron.js';
+import { LeaveBalance } from '../models/LeaveBalance.model.js';
 import { ApiError } from '../utils/ApiError.js';
 import { ApiResponse } from '../utils/ApiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Attendance } from '../models/Attendance.model.js';
 import { Payroll } from '../models/Payroll.model.js';
-import { processSingleEmployeePayroll } from './payroll.controller.js';
 
 // ── ROLE CONSTANTS ──
 const APPROVER_ROLES = ['SuperUser', 'HR', 'GM', 'VP', 'Director', 'Manager'];
@@ -176,14 +175,19 @@ export const applyLeave = asyncHandler(async (req, res) => {
   if (totalDays === 0) throw new ApiError(400, 'Selected date range consists only of Sundays or Holidays');
 
   // ── BALANCE VALIDATION & DEDUCTION ──
-  const employee = await Employee.findById(req.user._id);
-  if (leaveType === 'Paid') {
-    if ((employee.paidLeaveBalance || 0) < totalDays) {
-      throw new ApiError(400, `Insufficient Paid Leave balance. Available: ${employee.paidLeaveBalance || 0}`);
+  let leaveBalance = await LeaveBalance.findOne({ employeeId: req.user._id });
+  if (!leaveBalance) leaveBalance = new LeaveBalance({ employeeId: req.user._id });
+
+  const isPaidLeave = ['Paid', 'Casual', 'Sick', 'Earned'].includes(leaveType);
+  const isCompOffLeave = leaveType === 'CompOff';
+
+  if (isPaidLeave) {
+    if ((leaveBalance.paidLeaveBalance || 0) < totalDays) {
+      throw new ApiError(400, `Insufficient Paid Leave balance. Available: ${leaveBalance.paidLeaveBalance || 0}`);
     }
-  } else if (leaveType === 'CompOff') {
-    if ((employee.compOffBalance || 0) < totalDays) {
-      throw new ApiError(400, `Insufficient Comp-Off balance. Available: ${employee.compOffBalance || 0}`);
+  } else if (isCompOffLeave) {
+    if ((leaveBalance.compOffBalance || 0) < totalDays) {
+      throw new ApiError(400, `Insufficient Comp-Off balance. Available: ${leaveBalance.compOffBalance || 0}`);
     }
   }
 
@@ -204,42 +208,34 @@ export const applyLeave = asyncHandler(async (req, res) => {
       halfDayPeriod: halfDay ? halfDayPeriod : '',
       reason,
       ...approvalState,
-      actionHistory: [
-        {
-          action: 'Applied',
-          byEmployeeId: req.user._id,
-          byName: req.user.name,
-          byRole: req.user.role,
-          remarks: reason,
-          timestamp: new Date(),
-        },
-      ],
+      actionHistory: [{
+        action: 'Applied',
+        byEmployeeId: req.user._id,
+        byName: req.user.name,
+        byRole: req.user.role,
+        remarks: reason,
+        timestamp: new Date(),
+      }],
     }], { session });
 
     // 2. Deduct Balance Immediately (Tentative)
-    if (leaveType === 'Paid' || leaveType === 'CompOff') {
-      const update = leaveType === 'Paid' 
-        ? { $inc: { paidLeaveBalance: -totalDays } } 
-        : { $inc: { compOffBalance: -totalDays } };
-      
-      const updatedEmp = await Employee.findByIdAndUpdate(req.user._id, {
-        ...update,
-        $push: {
-          leaveBalanceHistory: {
-            type: 'Deduction',
-            leaveType,
-            amount: totalDays,
-            previousBalance: leaveType === 'Paid' ? employee.paidLeaveBalance : employee.compOffBalance,
-            newBalance: (leaveType === 'Paid' ? employee.paidLeaveBalance : employee.compOffBalance) - totalDays,
-            remarks: `Leave applied: ${start.toDateString()} to ${end.toDateString()} (Pending approval)`,
-            timestamp: new Date(),
-          }
-        }
-      }, { session, new: true });
+    if (isPaidLeave || isCompOffLeave) {
+      const balanceField = isPaidLeave ? 'paidLeaveBalance' : 'compOffBalance';
+      const prevBalance = leaveBalance[balanceField] || 0;
+      const newBalance = prevBalance - totalDays;
+      if (newBalance < 0) throw new ApiError(400, 'Insufficient balance');
 
-      if (updatedEmp.paidLeaveBalance < 0 || updatedEmp.compOffBalance < 0) {
-         throw new ApiError(400, 'Insufficient balance for this request');
-      }
+      leaveBalance[balanceField] = newBalance;
+      leaveBalance.history.push({
+        type: 'Deduction',
+        leaveType,
+        amount: totalDays,
+        previousBalance: prevBalance,
+        newBalance,
+        remarks: `Leave applied: ${start.toDateString()} to ${end.toDateString()} (Pending approval)`,
+        updatedBy: req.user._id,
+      });
+      await leaveBalance.save({ session });
     }
 
     await session.commitTransaction();
@@ -497,29 +493,28 @@ export const rejectLeave = asyncHandler(async (req, res) => {
     });
 
     // ── REFUND BALANCE ──
-    if (leave.leaveType === 'Paid' || leave.leaveType === 'CompOff') {
-      const employee = await Employee.findById(leave.employeeId);
-      if (employee) {
-        const update = leave.leaveType === 'Paid' 
-          ? { $inc: { paidLeaveBalance: leave.totalDays } } 
-          : { $inc: { compOffBalance: leave.totalDays } };
-        
-        const prevBalance = leave.leaveType === 'Paid' ? employee.paidLeaveBalance : employee.compOffBalance;
-        
-        await Employee.findByIdAndUpdate(employee._id, {
-          ...update,
-          $push: {
-            leaveBalanceHistory: {
-              type: 'Adjustment',
-              leaveType: leave.leaveType,
-              amount: leave.totalDays,
-              previousBalance: prevBalance,
-              newBalance: prevBalance + leave.totalDays,
-              remarks: `Leave rejected: Refund for ${leave.startDate.toDateString()}`,
-              timestamp: new Date(),
-            }
-          }
-        }, { session });
+    const isPaidLeaveRefund = ['Paid', 'Casual', 'Sick', 'Earned'].includes(leave.leaveType);
+    const isCompOffRefund = leave.leaveType === 'CompOff';
+
+    if (isPaidLeaveRefund || isCompOffRefund) {
+      const balanceDoc = await LeaveBalance.findOne({ employeeId: leave.employeeId }).session(session);
+      if (balanceDoc) {
+        const balanceField = isPaidLeaveRefund ? 'paidLeaveBalance' : 'compOffBalance';
+        const prevBalance = balanceDoc[balanceField] || 0;
+        const newBalance = prevBalance + leave.totalDays;
+
+        balanceDoc[balanceField] = newBalance;
+        balanceDoc.history.push({
+          type: 'Adjustment',
+          leaveType: leave.leaveType,
+          amount: leave.totalDays,
+          previousBalance: prevBalance,
+          newBalance: newBalance,
+          remarks: `Leave rejected: Refund for ${new Date(leave.startDate).toDateString()}`,
+          updatedBy: req.user._id,
+          timestamp: new Date(),
+        });
+        await balanceDoc.save({ session });
       }
     }
 
@@ -573,29 +568,28 @@ export const cancelLeave = asyncHandler(async (req, res) => {
     });
 
     // ── REFUND BALANCE ──
-    if (leave.leaveType === 'Paid' || leave.leaveType === 'CompOff') {
-      const employee = await Employee.findById(leave.employeeId);
-      if (employee) {
-        const update = leave.leaveType === 'Paid' 
-          ? { $inc: { paidLeaveBalance: leave.totalDays } } 
-          : { $inc: { compOffBalance: leave.totalDays } };
-        
-        const prevBalance = leave.leaveType === 'Paid' ? employee.paidLeaveBalance : employee.compOffBalance;
+    const isPaidLeaveCancel = ['Paid', 'Casual', 'Sick', 'Earned'].includes(leave.leaveType);
+    const isCompOffCancel = leave.leaveType === 'CompOff';
 
-        await Employee.findByIdAndUpdate(employee._id, {
-          ...update,
-          $push: {
-            leaveBalanceHistory: {
-              type: 'Adjustment',
-              leaveType: leave.leaveType,
-              amount: leave.totalDays,
-              previousBalance: prevBalance,
-              newBalance: prevBalance + leave.totalDays,
-              remarks: `Leave cancelled: Refund for ${leave.startDate.toDateString()}`,
-              timestamp: new Date(),
-            }
-          }
-        }, { session });
+    if (isPaidLeaveCancel || isCompOffCancel) {
+      const balanceDoc = await LeaveBalance.findOne({ employeeId: leave.employeeId }).session(session);
+      if (balanceDoc) {
+        const balanceField = isPaidLeaveCancel ? 'paidLeaveBalance' : 'compOffBalance';
+        const prevBalance = balanceDoc[balanceField] || 0;
+        const newBalance = prevBalance + leave.totalDays;
+
+        balanceDoc[balanceField] = newBalance;
+        balanceDoc.history.push({
+          type: 'Adjustment',
+          leaveType: leave.leaveType,
+          amount: leave.totalDays,
+          previousBalance: prevBalance,
+          newBalance: newBalance,
+          remarks: `Leave cancelled: Refund for ${new Date(leave.startDate).toDateString()}`,
+          updatedBy: req.user._id,
+          timestamp: new Date(),
+        });
+        await balanceDoc.save({ session });
       }
     }
 
@@ -719,28 +713,29 @@ export const adjustLeaveBalance = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'employeeId, leaveType, and amount are required');
   }
 
-  const employee = await Employee.findById(employeeId);
-  if (!employee) throw new ApiError(404, 'Employee not found');
+  let balanceDoc = await LeaveBalance.findOne({ employeeId });
+  if (!balanceDoc) {
+    balanceDoc = new LeaveBalance({ employeeId });
+  }
 
-  const prevBalance = leaveType === 'Paid' ? employee.paidLeaveBalance : employee.compOffBalance;
-  const newBalance = prevBalance + Number(amount);
+  const isPaidLeave = ['Paid', 'Casual', 'Sick', 'Earned'].includes(leaveType);
+  const balanceField = isPaidLeave ? 'paidLeaveBalance' : 'compOffBalance';
+  const prevBalance = balanceDoc[balanceField] || 0;
+  const newBalance = Math.max(0, prevBalance + Number(amount));
 
-  const update = leaveType === 'Paid' 
-    ? { paidLeaveBalance: newBalance } 
-    : { compOffBalance: newBalance };
-
-  employee.set(update);
-  employee.leaveBalanceHistory.push({
+  balanceDoc[balanceField] = newBalance;
+  balanceDoc.history.push({
     type: 'Adjustment',
     leaveType,
-    amount: Math.abs(amount),
+    amount: Math.abs(Number(amount)),
     previousBalance: prevBalance,
     newBalance: newBalance,
     remarks: remarks || 'Administrative adjustment',
+    updatedBy: req.user._id,
     timestamp: new Date(),
   });
 
-  await employee.save();
+  await balanceDoc.save();
 
-  res.json(new ApiResponse(200, employee, `Balance adjusted successfully. New ${leaveType} balance: ${newBalance}`));
+  res.json(new ApiResponse(200, balanceDoc, `Balance adjusted successfully. New ${leaveType} balance: ${newBalance}`));
 });

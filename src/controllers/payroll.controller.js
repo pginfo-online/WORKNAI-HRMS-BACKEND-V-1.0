@@ -3,406 +3,118 @@ import { Attendance } from '../models/Attendance.model.js';
 import { Employee } from '../models/Employee.model.js';
 import { Holiday } from '../models/Holiday.model.js';
 import { Leave } from '../models/Leave.model.js';
+import { PayrollSettings } from '../models/PayrollSettings.model.js';
 import { ApiError } from '../utils/ApiError.js';
 import { ApiResponse } from '../utils/ApiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { evaluateWorkingMinutes } from '../utils/attendanceHelper.js';
-import PDFDocument from 'pdfkit';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { generateSalarySlipPdfBuffer, renderSalarySlipDoc } from '../utils/pdfHelper.js';
+import { uploadToCloudinary } from '../services/cloudinary.service.js';
+import { Readable } from 'stream';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-const convertNumberToWords = (amount) => {
-  const words = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
-  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
-  if (amount === 0) return "Zero";
-  let word = "";
-  let tempAmount = Math.floor(amount);
-  if (tempAmount >= 10000000) { word += convertNumberToWords(Math.floor(tempAmount / 10000000)) + " Crore "; tempAmount %= 10000000; }
-  if (tempAmount >= 100000) { word += convertNumberToWords(Math.floor(tempAmount / 100000)) + " Lakh "; tempAmount %= 100000; }
-  if (tempAmount >= 1000) { word += convertNumberToWords(Math.floor(tempAmount / 1000)) + " Thousand "; tempAmount %= 1000; }
-  if (tempAmount >= 100) { word += convertNumberToWords(Math.floor(tempAmount / 100)) + " Hundred "; tempAmount %= 100; }
-  if (tempAmount > 0) {
-    if (word !== "") word += "and ";
-    if (tempAmount < 20) word += words[tempAmount];
-    else { word += tens[Math.floor(tempAmount / 10)] + " "; word += words[tempAmount % 10]; }
-  }
-  return word.trim();
-};
+// ─── PT CALCULATION WITH DYNAMIC SETTINGS ─────────────────────────────────────
 
 /**
- * PT is always calculated on the employee's BASE SALARY (CTC), not grossEarnings.
- * Rules:
- *  - February (month index 1, 0-based): flat ₹300
- *  - Female: ₹200 if baseSalary > ₹25,000, else ₹0
- *  - Male / Other: ₹200 if baseSalary > ₹10,000, else ₹0
- *    (The ₹175 tier for 7,500–10,000 has been removed per updated policy)
+ * Calculates Professional Tax (PT) based on dynamic settings configured by Admin/HR.
+ * @param {Number} baseSalary - Monthly fixed CTC / basic
+ * @param {String} gender - Gender (Male/Female/Other)
+ * @param {Number} monthIndex - 0-based month (0=Jan, 1=Feb, etc.)
+ * @param {Object} settings - PayrollSettings document
+ * @returns {Number} PT deduction in INR
  */
-const calculatePT = (baseSalary, gender, month) => {
-  const normalizedGender = gender?.toLowerCase();
+export const calculatePT = (baseSalary, gender, monthIndex, settings) => {
+  // If PT deduction is disabled in settings, return 0
+  if (!settings || !settings.ptEnabled) {
+    return 0;
+  }
+
+  const normalizedGender = (gender || '').toLowerCase();
+  const isFebruary = (monthIndex === 1);
 
   // =========================
   // FEMALE
   // =========================
   if (normalizedGender === 'female') {
-    // Up to 25,000 => NIL
-    if (baseSalary <= 25000) {
+    if (baseSalary <= (settings.femaleThreshold ?? 25000)) {
       return 0;
     }
-
-    // February => 300
-    if (month === 1) {
-      return 300;
+    if (isFebruary) {
+      return settings.femaleFebPtAmount ?? 300;
     }
-
-    // Other months
-    return 200;
+    return settings.femalePtAmount ?? 200;
   }
 
   // =========================
   // MALE / OTHER
   // =========================
-
-  // Up to 7,500 => NIL
-  if (baseSalary <= 7500) {
+  if (baseSalary <= (settings.maleMinThreshold ?? 7500)) {
     return 0;
   }
 
-  // 7,501 to 10,000 => 175
-  if (baseSalary <= 10000) {
-    return 175;
+  if (baseSalary <= (settings.maleMidThreshold ?? 10000)) {
+    return settings.maleMidPtAmount ?? 175;
   }
 
-  // Above 10,000
-  if (month === 1) {
-    return 300; // February
+  if (isFebruary) {
+    return settings.maleFebPtAmount ?? 300;
   }
 
-  return 200;
+  return settings.maleMaxPtAmount ?? 200;
 };
 
+// ─── ASYNC CLOUDINARY UPLOAD HELPER ──────────────────────────────────────────
 
-// const calculatePT = (baseSalary, gender, month) => {
-//   // February special rule (0-indexed: Jan=0, Feb=1)
-//   if (month === 1) {
-//     return 300;
-//   }
+/**
+ * Generates PDF and uploads to Cloudinary in background, then updates the Payroll document.
+ */
+export const generateAndUploadSlipBackground = async (payrollId) => {
+  try {
+    const payroll = await Payroll.findById(payrollId).populate('employeeId', 'joiningDate name employeeCode department position panNumber bankName accountNumber ifsc branch gender');
+    if (!payroll) return;
 
-//   if (gender === 'Female') {
-//     return baseSalary > 25000 ? 200 : 0;
-//   } else {
-//     // Male or Other
-//     return baseSalary > 10000 ? 200 : 0;
-//   }
-// };
+    const pdfBuffer = await generateSalarySlipPdfBuffer(payroll);
+    const folder = 'payrolls';
+    const publicId = `slip_${payroll.employeeCode}_${payroll.month}_${payroll.year}_${Date.now()}`;
 
-// ─── GENERATE PAYROLL (HELPER FOR SINGLE EMPLOYEE) ──────────────────────────
+    const uploadRes = await uploadToCloudinary(pdfBuffer, {
+      folder,
+      public_id: publicId,
+      resource_type: 'raw',
+      format: 'pdf',
+      overwrite: true,
+    });
 
-// export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDate, targetMonth, targetYear, processedBy }) => {
-//   const employee = await Employee.findById(employeeId);
-//   if (!employee) return null;
+    if (uploadRes?.secure_url) {
+      await Payroll.findByIdAndUpdate(payrollId, {
+        salarySlipUrl: uploadRes.secure_url,
+      });
+    }
+  } catch (err) {
+    console.error(`[Cloudinary PDF Upload Error for Payroll ${payrollId}]:`, err?.message || err);
+  }
+};
 
-//   // Total days in range is inclusive: count every calendar day from fromDate to toDate.
-//   // We add 1 because both endpoints are included (e.g. Mar 21 → Apr 20 = 31 days, not 30).
-//   // toDate is set to 23:59:59 on the last day, so we floor the difference then add 1.
-//   const totalDaysInRange = Math.floor((toDate - fromDate) / (1000 * 60 * 60 * 24)) + 1;
+// ─── CORE PAYROLL PROCESSOR FOR SINGLE EMPLOYEE ──────────────────────────────
 
-//   // Calculate extended range for sandwich checking
-//   const extendedFromDate = new Date(fromDate);
-//   extendedFromDate.setUTCDate(extendedFromDate.getUTCDate() - 10);
-//   const extendedToDate = new Date(toDate);
-//   extendedToDate.setUTCDate(extendedToDate.getUTCDate() + 10);
-
-//   // ── FETCH ATTENDANCE, HOLIDAYS & APPROVED LEAVES (EXTENDED FOR SANDWICH CHECK) ──
-//   const [attendanceRecords, holidayRecords, approvedLeaves] = await Promise.all([
-//     Attendance.find({
-//       employeeId,
-//       date: { $gte: extendedFromDate, $lte: extendedToDate }
-//     }),
-//     Holiday.find({
-//       date: { $gte: extendedFromDate, $lte: extendedToDate }
-//     }),
-//     // Only fetch leaves that have been fully approved
-//     Leave.find({
-//       employeeId,
-//       overallStatus: 'Approved',
-//       startDate: { $lte: extendedToDate },
-//       endDate: { $gte: extendedFromDate }
-//     })
-//   ]);
-
-//   const summary = {
-//     present: 0,
-//     half: 0,
-//     absent: 0,
-//     holiday: 0,
-//     weekOff: 0
-//   };
-
-//   const halfDayDetails = [];
-//   const absentDayDetails = [];
-//   const presentDayDetails = [];
-
-//   const getUTCDateStr = (date) => {
-//     const d = new Date(date);
-//     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-//   };
-
-//   // Status cache for extended range
-//   const statusCache = {};
-
-//   const getDayStatus = (d) => {
-//     const dStr = getUTCDateStr(d);
-//     if (statusCache[dStr]) return statusCache[dStr];
-
-//     const isSunday = d.getUTCDay() === 0;
-//     const isHolid = holidayRecords.some(h => getUTCDateStr(h.date) === dStr);
-
-//     const record = attendanceRecords.find(r => getUTCDateStr(r.date) === dStr);
-    
-//     // Check if employee worked on Sunday/Holiday
-//     if (record && (record.status === 'P' || record.status === 'Half' || record.status === 'Coff')) {
-//       if (record.status === 'Coff') {
-//         statusCache[dStr] = 'PRESENT';
-//         return 'PRESENT';
-//       }
-//       const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
-//       const evalResult = evaluateWorkingMinutes(d, workedMins);
-//       if (evalResult.isFullDay && record.status !== 'Half') {
-//         statusCache[dStr] = 'PRESENT';
-//         return 'PRESENT';
-//       } else if (evalResult.isHalfDay || record.status === 'Half') {
-//         statusCache[dStr] = 'HALF';
-//         return 'HALF';
-//       }
-//     }
-
-//     if (isSunday || isHolid) {
-//       statusCache[dStr] = 'WO_HOLIDAY';
-//       return 'WO_HOLIDAY';
-//     }
-
-//     if (record) {
-//       if (record.status === 'P' || record.status === 'Half' || record.status === 'Coff') {
-//         if (record.status === 'Coff') {
-//           statusCache[dStr] = 'PRESENT';
-//           return 'PRESENT';
-//         }
-//         const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
-//         const evalResult = evaluateWorkingMinutes(d, workedMins);
-//         if (evalResult.isFullDay && record.status !== 'Half') {
-//           statusCache[dStr] = 'PRESENT';
-//           return 'PRESENT';
-//         } else if (evalResult.isHalfDay || record.status === 'Half') {
-//           statusCache[dStr] = 'HALF';
-//           return 'HALF';
-//         } else {
-//           statusCache[dStr] = 'LEAVE_ABSENT';
-//           return 'LEAVE_ABSENT';
-//         }
-//       } else if (['Paid', 'Sick', 'Casual', 'Earned', 'CompOff', 'L'].includes(record.status)) {
-//         const hasApprovedLeave = approvedLeaves.some(leave => {
-//           const leaveStart = getUTCDateStr(leave.startDate);
-//           const leaveEnd = getUTCDateStr(leave.endDate);
-//           return dStr >= leaveStart && dStr <= leaveEnd;
-//         });
-
-//         if (hasApprovedLeave) {
-//           statusCache[dStr] = 'LEAVE_ABSENT';
-//           return 'LEAVE_ABSENT';
-//         } else {
-//           statusCache[dStr] = 'LEAVE_ABSENT';
-//           return 'LEAVE_ABSENT';
-//         }
-//       } else {
-//         statusCache[dStr] = 'LEAVE_ABSENT';
-//         return 'LEAVE_ABSENT';
-//       }
-//     } else {
-//       statusCache[dStr] = 'LEAVE_ABSENT';
-//       return 'LEAVE_ABSENT';
-//     }
-//   };
-
-//   // Pre-fill cache
-//   let tempDate = new Date(extendedFromDate);
-//   while (tempDate <= extendedToDate) {
-//     getDayStatus(tempDate);
-//     tempDate.setUTCDate(tempDate.getUTCDate() + 1);
-//   }
-
-//   const isSandwiched = (d) => {
-//     if (getDayStatus(d) !== 'WO_HOLIDAY') {
-//       return false;
-//     }
-
-//     // Search backwards
-//     let leftStatus = null;
-//     let tempLeft = new Date(d);
-//     while (true) {
-//       tempLeft.setUTCDate(tempLeft.getUTCDate() - 1);
-//       if (tempLeft < extendedFromDate) break;
-//       const status = getDayStatus(tempLeft);
-//       if (status !== 'WO_HOLIDAY') {
-//         leftStatus = status;
-//         break;
-//       }
-//     }
-
-//     // Search forwards
-//     let rightStatus = null;
-//     let tempRight = new Date(d);
-//     while (true) {
-//       tempRight.setUTCDate(tempRight.getUTCDate() + 1);
-//       if (tempRight > extendedToDate) break;
-//       const status = getDayStatus(tempRight);
-//       if (status !== 'WO_HOLIDAY') {
-//         rightStatus = status;
-//         break;
-//       }
-//     }
-
-//     return leftStatus === 'LEAVE_ABSENT' && rightStatus === 'LEAVE_ABSENT';
-//   };
-
-//   const sandwichDetails = [];
-
-//   let current = new Date(fromDate);
-//   while (current <= toDate) {
-//     const dStr = getUTCDateStr(current);
-//     const record = attendanceRecords.find(r => getUTCDateStr(r.date) === dStr);
-//     const isSunday = current.getUTCDay() === 0; // Use UTC day since fromDate/toDate are UTC
-//     const isHolid = holidayRecords.some(h => getUTCDateStr(h.date) === dStr);
-
-//     if (isSunday) {
-//       summary.weekOff++;
-//       if (isSandwiched(current)) {
-//         sandwichDetails.push({
-//           date: new Date(current),
-//           reason: 'Weekly Off (Sandwiched)'
-//         });
-//       }
-//     } else if (isHolid) {
-//       summary.holiday++;
-//       if (isSandwiched(current)) {
-//         sandwichDetails.push({
-//           date: new Date(current),
-//           reason: 'Holiday (Sandwiched)'
-//         });
-//       }
-//     } else if (record) {
-//       if (record.status === 'P' || record.status === 'Half' || record.status === 'Coff') {
-//         if (record.status === 'Coff') {
-//           summary.present++;
-//           presentDayDetails.push({
-//             date: new Date(current),
-//             reason: 'Compensatory Off (Coff)'
-//           });
-//         } else {
-//           const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
-//           const evalResult = evaluateWorkingMinutes(current, workedMins);
-
-//           if (evalResult.isFullDay && record.status !== 'Half') {
-//             summary.present++;
-//             presentDayDetails.push({
-//               date: new Date(current),
-//               reason: `Full Present: Worked ${(record.totalHours || workedMins / 60).toFixed(2)} hrs`
-//             });
-//           } else if (evalResult.isHalfDay || record.status === 'Half') {
-//             summary.half++;
-//             halfDayDetails.push({ 
-//               date: new Date(current), 
-//               reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Required: ${evalResult.requiredFullMinutes} min, worked: ${workedMins} min)` 
-//             });
-//           } else {
-//             summary.absent++;
-//             absentDayDetails.push({ 
-//               date: new Date(current), 
-//               reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Below half day threshold: ${evalResult.minHalfMinutes} min)` 
-//             });
-//           }
-//         }
-//       } else if (['Paid', 'Sick', 'Casual', 'Earned', 'CompOff', 'L'].includes(record.status)) {
-//         // All leave types (approved or not) count as absent — no salary credit for leaves.
-//         const currentDateStr = getUTCDateStr(current);
-//         const hasApprovedLeave = approvedLeaves.some(leave => {
-//           const leaveStart = getUTCDateStr(leave.startDate);
-//           const leaveEnd = getUTCDateStr(leave.endDate);
-//           return currentDateStr >= leaveStart && currentDateStr <= leaveEnd;
-//         });
-//         const leaveLabel = hasApprovedLeave
-//           ? `Leave (${record.status}) — Approved`
-//           : `Leave (${record.status}) — Unapproved / LWP`;
-//         summary.absent++;
-//         absentDayDetails.push({ date: new Date(current), reason: leaveLabel });
-//       } else {
-//         summary.absent++;
-//         absentDayDetails.push({ date: new Date(current), reason: `Status: ${record.status}` });
-//       }
-//     } else {
-//       summary.absent++;
-//       absentDayDetails.push({ date: new Date(current), reason: 'No Check-in' });
-//     }
-//     current.setUTCDate(current.getUTCDate() + 1);
-//   }
-
-//   const sandwichDeductions = sandwichDetails.length;
-//   // paidDays: present + half-days + week-offs + holidays minus any sandwich deductions.
-//   // Leaves are NOT included — all leave types are treated as absent (LWP).
-//   const paidDays = summary.present + (summary.half * 0.5) + summary.weekOff + summary.holiday - sandwichDeductions;
-//   const baseSalary = employee.salary || 0;
-  
-//   const divisor = totalDaysInRange >= 28 ? totalDaysInRange : 30;
-//   const dailyRate = baseSalary / divisor;
-//   const grossEarnings = parseFloat((dailyRate * paidDays).toFixed(2));
-
-//   const professionalTax = calculatePT(baseSalary, employee.gender, toDate.getUTCMonth());
-//   const netSalary = Math.max(0, grossEarnings - professionalTax);
-
-//   // leavesTaken = all absent days (includes all leave types) + half-day deductions + sandwich deductions
-//   const leavesTaken = summary.absent + (summary.half * 0.5) + sandwichDeductions;
-
-//   return await Payroll.findOneAndUpdate(
-//     { employeeId, month: targetMonth, year: targetYear },
-//     {
-//       employeeCode: employee.employeeCode,
-//       employeeName: employee.name,
-//       fromDate, toDate,
-//       totalDaysInMonth: totalDaysInRange,
-//       presentDays: summary.present,
-//       presentDayDetails,
-//       halfDays: summary.half,
-//       halfDayDetails,
-//       absentDays: summary.absent,
-//       absentDayDetails,
-//       paidLeaves: 0,           // deprecated — all leaves are now absent
-//       unpaidLeaves: summary.absent + sandwichDeductions,
-//       holidays: summary.holiday,
-//       weekOffs: summary.weekOff,
-//       sandwichDeductions,
-//       sandwichDetails,
-//       paidDays, baseSalary, grossEarnings, professionalTax, netSalary,
-//       leavesTaken,
-//       status: 'Processed',
-//       processedBy
-//     },
-//     { upsert: true, new: true }
-//   );
-// }
-
-export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDate, targetMonth, targetYear, processedBy }) => {
+export const processSingleEmployeePayroll = async ({
+  employeeId,
+  fromDate,
+  toDate,
+  targetMonth,
+  targetYear,
+  processedBy,
+  settings: passedSettings = null,
+}) => {
   const employee = await Employee.findById(employeeId);
   if (!employee) return null;
 
-  // Total days in range is inclusive: count every calendar day from fromDate to toDate.
-  const totalDaysInRange = Math.floor((toDate - fromDate) / (1000 * 60 * 60 * 24)) + 1;
+  // Load PT settings if not passed
+  const settings = passedSettings || (await PayrollSettings.getSettings());
 
-  // Calculate extended range for sandwich checking
+  // Total days in range is inclusive (both endpoints included)
+  const totalDaysInRange = Math.floor((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+
+  // Extended range for sandwich deduction analysis (10 days buffer)
   const extendedFromDate = new Date(fromDate);
   extendedFromDate.setUTCDate(extendedFromDate.getUTCDate() - 10);
   const extendedToDate = new Date(toDate);
@@ -412,17 +124,17 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
   const [attendanceRecords, holidayRecords, approvedLeaves] = await Promise.all([
     Attendance.find({
       employeeId,
-      date: { $gte: extendedFromDate, $lte: extendedToDate }
+      date: { $gte: extendedFromDate, $lte: extendedToDate },
     }),
     Holiday.find({
-      date: { $gte: extendedFromDate, $lte: extendedToDate }
+      date: { $gte: extendedFromDate, $lte: extendedToDate },
     }),
     Leave.find({
       employeeId,
       overallStatus: 'Approved',
       startDate: { $lte: extendedToDate },
-      endDate: { $gte: extendedFromDate }
-    })
+      endDate: { $gte: extendedFromDate },
+    }),
   ]);
 
   const summary = {
@@ -431,7 +143,7 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
     absent: 0,
     holiday: 0,
     weekOff: 0,
-    paidLeave: 0
+    paidLeave: 0,
   };
 
   const halfDayDetails = [];
@@ -451,21 +163,24 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
     if (statusCache[dStr]) return statusCache[dStr];
 
     const isSunday = d.getUTCDay() === 0;
-    const isHolid = holidayRecords.some(h => getUTCDateStr(h.date) === dStr);
+    const isHolid = holidayRecords.some((h) => getUTCDateStr(h.date) === dStr);
 
     if (isSunday || isHolid) {
       statusCache[dStr] = 'WO_HOLIDAY';
       return 'WO_HOLIDAY';
     }
 
-    const record = attendanceRecords.find(r => getUTCDateStr(r.date) === dStr);
-    
-    // If they physically worked, it breaks the sandwich
-    //  NEW CODE: Only physical work breaks the sandwich
-    if (record && ['P', 'Half'].includes(record.status)) {
+    const record = attendanceRecords.find((r) => getUTCDateStr(r.date) === dStr);
+
+    // Only physical work or credited comp-off breaks the sandwich
+    if (record && ['P', 'Half', 'Coff'].includes(record.status)) {
+      if (record.status === 'Coff') {
+        statusCache[dStr] = 'PRESENT';
+        return 'PRESENT';
+      }
       const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
       const evalResult = evaluateWorkingMinutes(d, workedMins);
-      
+
       if (evalResult.isFullDay && record.status !== 'Half') {
         statusCache[dStr] = 'PRESENT';
         return 'PRESENT';
@@ -475,7 +190,6 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
       }
     }
 
-    // If they didn't work (Leave, Absent, 'AUTO', or No Record), it's a potential sandwich bread
     statusCache[dStr] = 'LEAVE_ABSENT';
     return 'LEAVE_ABSENT';
   };
@@ -520,10 +234,9 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
 
   const sandwichDetails = [];
 
-  // ── 3. MAIN PAYROLL LOOP ──
-  // Create a normalized string for the joining date (if it exists in your schema)
+  // ── 3. MAIN PAYROLL CALCULATION LOOP ──
   let joiningDateStr = null;
-  if (employee.joiningDate) { 
+  if (employee.joiningDate) {
     joiningDateStr = getUTCDateStr(employee.joiningDate);
   }
 
@@ -531,33 +244,37 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
   while (current <= toDate) {
     const dStr = getUTCDateStr(current);
 
-    // 👇 Intercept days before the employee was hired
+    // Days before employee's official joining date are non-payable
     if (joiningDateStr && dStr < joiningDateStr) {
-      // Do not increment absent++, weekOff++, etc. It is just a non-payable day.
       absentDayDetails.push({ date: new Date(current), reason: 'Before Joining Date' });
       current.setUTCDate(current.getUTCDate() + 1);
-      continue; // Skip the rest of the loop for this day
+      continue;
     }
 
-    const record = attendanceRecords.find(r => getUTCDateStr(r.date) === dStr);
+    const record = attendanceRecords.find((r) => getUTCDateStr(r.date) === dStr);
     const isSunday = current.getUTCDay() === 0;
-    const isHolid = holidayRecords.some(h => getUTCDateStr(h.date) === dStr);
+    const isHolid = holidayRecords.some((h) => getUTCDateStr(h.date) === dStr);
 
     if (isSunday) {
       summary.weekOff++;
-      if (isSandwiched(current)) sandwichDetails.push({ date: new Date(current), reason: 'Weekly Off (Sandwiched)' });
+      if (isSandwiched(current)) {
+        sandwichDetails.push({ date: new Date(current), reason: 'Weekly Off (Sandwiched)' });
+      }
     } else if (isHolid) {
       summary.holiday++;
-      if (isSandwiched(current)) sandwichDetails.push({ date: new Date(current), reason: 'Holiday (Sandwiched)' });
+      if (isSandwiched(current)) {
+        const matchingHol = holidayRecords.find((h) => getUTCDateStr(h.date) === dStr);
+        sandwichDetails.push({ date: new Date(current), reason: `Holiday (${matchingHol?.name || 'Public'}) (Sandwiched)` });
+      }
     } else {
-      // 1. Look for an approved leave ticket independently
-      const matchingLeave = approvedLeaves.find(leave => {
+      // 1. Look for approved leave ticket
+      const matchingLeave = approvedLeaves.find((leave) => {
         const leaveStart = getUTCDateStr(leave.startDate);
         const leaveEnd = getUTCDateStr(leave.endDate);
         return dStr >= leaveStart && dStr <= leaveEnd;
       });
 
-      // 2. Did they physically work? (Prioritize actual work over a leave)
+      // 2. Physical work takes precedence over leave application
       if (record && ['P', 'Half', 'Coff'].includes(record.status)) {
         if (record.status === 'Coff') {
           summary.present++;
@@ -568,64 +285,100 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
 
           if (evalResult.isFullDay && record.status !== 'Half') {
             summary.present++;
-            presentDayDetails.push({ date: new Date(current), reason: `Full Present: Worked ${(record.totalHours || workedMins / 60).toFixed(2)} hrs` });
+            presentDayDetails.push({
+              date: new Date(current),
+              reason: `Full Present: Worked ${(record.totalHours || workedMins / 60).toFixed(2)} hrs`,
+            });
           } else if (evalResult.isHalfDay || record.status === 'Half') {
             summary.half++;
-            halfDayDetails.push({ date: new Date(current), reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Required: ${evalResult.requiredFullMinutes} min)` });
+            halfDayDetails.push({
+              date: new Date(current),
+              reason: `Half Day: Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Req: ${evalResult.requiredFullMinutes} min)`,
+            });
           } else {
             summary.absent++;
-            absentDayDetails.push({ date: new Date(current), reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Below threshold)` });
+            absentDayDetails.push({
+              date: new Date(current),
+              reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Below threshold)`,
+            });
           }
         }
-      } 
-      // 3. If they didn't work, process the Leave ticket directly from the Leave schema
+      }
+      // 3. Process Approved Leave (Paid, CompOff, Casual, Sick, Earned are paid; Unpaid / Other are LWP)
       else if (matchingLeave) {
-        const actualType = matchingLeave.leaveType; 
-        
-        // Strict Business Rule: Only 'Paid' leaves generate pay.
-        if (actualType === 'Paid') {
+        const actualType = matchingLeave.leaveType;
+        const isPaidLeaveType = ['Paid', 'CompOff', 'Casual', 'Sick', 'Earned', 'MaternityPaternity'].includes(actualType);
+
+        if (isPaidLeaveType) {
           summary.paidLeave++;
-          presentDayDetails.push({ date: new Date(current), reason: `Paid Leave — Approved` });
+          presentDayDetails.push({
+            date: new Date(current),
+            reason: `Approved Leave (${actualType}) — Paid`,
+          });
         } else {
           summary.absent++;
-          absentDayDetails.push({ date: new Date(current), reason: `Leave (${actualType}) — Approved (LWP)` });
+          absentDayDetails.push({
+            date: new Date(current),
+            reason: `Approved Leave (${actualType}) — Unpaid (LWP)`,
+          });
         }
-      } 
-      // 4. No work done, no approved leave ticket found
+      }
+      // 4. Incomplete or unapproved absence
       else if (record) {
         summary.absent++;
-        absentDayDetails.push({ date: new Date(current), reason: `Status: ${record.status} (Unapproved / LWP)` });
+        absentDayDetails.push({
+          date: new Date(current),
+          reason: `Status: ${record.status} (Unapproved / LWP)`,
+        });
       } else {
         summary.absent++;
-        absentDayDetails.push({ date: new Date(current), reason: 'No Check-in / No Leave Applied' });
+        absentDayDetails.push({
+          date: new Date(current),
+          reason: 'No Check-in / No Leave Applied',
+        });
       }
     }
+
     current.setUTCDate(current.getUTCDate() + 1);
   }
 
   // ── 4. FINANCIAL CALCULATIONS ──
   const sandwichDeductions = sandwichDetails.length;
-  
-  // paidDays: present + half-days + week-offs + holidays + paid leaves minus any sandwich deductions.
-  const paidDays = summary.present + (summary.half * 0.5) + summary.weekOff + summary.holiday + summary.paidLeave - sandwichDeductions;
-  const baseSalary = employee.salary || 0;
-  
-  const divisor = totalDaysInRange >= 28 ? totalDaysInRange : 30;
+
+  // Paid Days = Present + Half Days (0.5 each) + Week Offs + Holidays + Paid Leaves - Sandwich Deductions
+  const rawPaidDays =
+    summary.present +
+    summary.half * 0.5 +
+    summary.weekOff +
+    summary.holiday +
+    summary.paidLeave -
+    sandwichDeductions;
+  const paidDays = Math.max(0, Math.min(totalDaysInRange, rawPaidDays));
+
+  const baseSalary = Number(employee.salary) || 0;
+  const divisor = totalDaysInRange >= 28 ? totalDaysInRange : (totalDaysInRange > 0 ? totalDaysInRange : 30);
   const dailyRate = baseSalary / divisor;
   const grossEarnings = parseFloat((dailyRate * paidDays).toFixed(2));
 
-  const professionalTax = calculatePT(baseSalary, employee.gender, toDate.getUTCMonth());
-  const netSalary = Math.max(0, grossEarnings - professionalTax);
+  // Dynamic PT deduction calculation
+  const professionalTax = calculatePT(baseSalary, employee.gender, toDate.getUTCMonth(), settings);
+  const netSalary = Math.max(0, parseFloat((grossEarnings - professionalTax).toFixed(2)));
 
-  const leavesTaken = summary.absent + (summary.half * 0.5) + sandwichDeductions;
+  // Due date: 10th of following month
+  const nextMonth = targetMonth === 12 ? 1 : targetMonth + 1;
+  const nextYear = targetMonth === 12 ? targetYear + 1 : targetYear;
+  const paymentDueDate = new Date(Date.UTC(nextYear, nextMonth - 1, 10, 0, 0, 0));
 
-  // ── 5. SAVE TO DB ──
-  return await Payroll.findOneAndUpdate(
+  // ── 5. PERSIST TO DATABASE ──
+  const savedPayroll = await Payroll.findOneAndUpdate(
     { employeeId, month: targetMonth, year: targetYear },
     {
       employeeCode: employee.employeeCode,
       employeeName: employee.name,
-      fromDate, toDate,
+      department: employee.department,
+      fromDate,
+      toDate,
+      paymentDueDate,
       totalDaysInMonth: totalDaysInRange,
       presentDays: summary.present,
       presentDayDetails,
@@ -633,20 +386,33 @@ export const processSingleEmployeePayroll = async ({ employeeId, fromDate, toDat
       halfDayDetails,
       absentDays: summary.absent,
       absentDayDetails,
-      paidLeaves: summary.paidLeave,
-      unpaidLeaves: summary.absent + sandwichDeductions,
+      paidLeavesTaken: summary.paidLeave,
+      unpaidLeavesTaken: summary.absent + sandwichDeductions,
       holidays: summary.holiday,
       weekOffs: summary.weekOff,
       sandwichDeductions,
       sandwichDetails,
-      paidDays, baseSalary, grossEarnings, professionalTax, netSalary,
-      leavesTaken,
+      paidDays,
+      baseSalary,
+      grossEarnings,
+      professionalTax,
+      netSalary,
       status: 'Processed',
-      processedBy
+      processedBy,
+      processedAt: new Date(),
     },
     { upsert: true, new: true }
   );
-}
+
+  // Trigger background Cloudinary upload
+  generateAndUploadSlipBackground(savedPayroll._id).catch((e) => {
+    console.error(`Background upload failed for ${employee.name}:`, e.message);
+  });
+
+  return savedPayroll;
+};
+
+// ─── GENERATE PAYROLL (SINGLE) ───────────────────────────────────────────────
 
 export const generatePayroll = asyncHandler(async (req, res) => {
   const { employeeId, month, year, startDate, endDate } = req.body;
@@ -661,23 +427,28 @@ export const generatePayroll = asyncHandler(async (req, res) => {
   let targetMonth, targetYear;
 
   if (startDate && endDate) {
-    // Force UTC midnight to prevent timezone-related day shifts during generation
     fromDate = new Date(`${startDate}T00:00:00Z`);
     toDate = new Date(`${endDate}T23:59:59Z`);
     targetMonth = toDate.getUTCMonth() + 1;
     targetYear = toDate.getUTCFullYear();
   } else if (month && year) {
-    // Default cycle (21st to 20th) logic in UTC
-    fromDate = new Date(Date.UTC(year, month - 2, 21, 0, 0, 0));
-    toDate = new Date(Date.UTC(year, month - 1, 20, 23, 59, 59));
-    targetMonth = month;
-    targetYear = year;
+    const m = Number(month);
+    const y = Number(year);
+    fromDate = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
+    toDate = new Date(Date.UTC(y, m, 0, 23, 59, 59, 999));
+    targetMonth = m;
+    targetYear = y;
   } else {
     throw new ApiError(400, 'Either startDate/endDate or month/year is required');
   }
 
   const payroll = await processSingleEmployeePayroll({
-    employeeId, fromDate, toDate, targetMonth, targetYear, processedBy: req.user._id
+    employeeId,
+    fromDate,
+    toDate,
+    targetMonth,
+    targetYear,
+    processedBy: req.user._id,
   });
 
   if (!payroll) throw new ApiError(404, 'Employee not found');
@@ -695,48 +466,71 @@ export const generateAllPayroll = asyncHandler(async (req, res) => {
   const targetMonth = toDate.getUTCMonth() + 1;
   const targetYear = toDate.getUTCFullYear();
 
-  // Fetch ALL active employees
+  // Load PT settings once for entire batch
+  const settings = await PayrollSettings.getSettings();
+
   const employees = await Employee.find({ status: 'Active' });
-  
   const results = [];
-  // Use Promise.all with batching if employees > 100 to avoid overwhelming DB? 
-  // For ~50 employees, a simple loop or Promise.all is fine.
+
   for (const emp of employees) {
     try {
       const payroll = await processSingleEmployeePayroll({
-        employeeId: emp._id, fromDate, toDate, targetMonth, targetYear, processedBy: req.user._id
+        employeeId: emp._id,
+        fromDate,
+        toDate,
+        targetMonth,
+        targetYear,
+        processedBy: req.user._id,
+        settings,
       });
       if (payroll) results.push(payroll);
     } catch (err) {
-      console.error(`Failed for ${emp.name}:`, err);
+      console.error(`Failed processing payroll for ${emp.name} (${emp.employeeCode}):`, err);
     }
   }
 
-  res.status(200).json(new ApiResponse(200, { count: results.length }, `Successfully processed payroll for ${results.length} employees`));
+  res.status(200).json(
+    new ApiResponse(
+      200,
+      { count: results.length, totalActive: employees.length },
+      `Successfully processed payroll for ${results.length} active employees`
+    )
+  );
 });
-
 
 // ─── GET PAYROLL LIST ────────────────────────────────────────────────────────
 
 export const getPayrollList = asyncHandler(async (req, res) => {
-  const { month, year, status, startDate, endDate, employeeId, self, page = 1, limit = 1000 } = req.query;
+  const {
+    month,
+    year,
+    status,
+    startDate,
+    endDate,
+    employeeId,
+    department,
+    search,
+    self,
+    page = 1,
+    limit = 1000,
+  } = req.query;
+
   const isManagement = ['SuperUser', 'HR', 'Director', 'VP', 'GM', 'Manager'].includes(req.user.role);
-  
   let query = {};
 
-  // ── ROLE PROTECTION & SELF-QUERY ──
-  if (self === 'true') {
-    // Personal Portal View (Always restricted to own records)
-    query.employeeId = req.user._id;
-  } else if (!isManagement) {
-    // Non-management role (Always restricted to own records)
+  // ── ROLE PERMISSIONS & SELF FILTER ──
+  if (self === 'true' || !isManagement) {
     query.employeeId = req.user._id;
   } else if (employeeId) {
-    // Management viewing a specific employee
     query.employeeId = employeeId;
   }
-  // Otherwise: Manager viewing all (e.g. Admin Dashboard list)
 
+  // Department filter
+  if (department && department !== 'All') {
+    query.department = department;
+  }
+
+  // Date Range or Month/Year Filter
   if (startDate && endDate) {
     const start = new Date(`${startDate}T00:00:00Z`);
     const end = new Date(`${endDate}T23:59:59Z`);
@@ -748,8 +542,17 @@ export const getPayrollList = asyncHandler(async (req, res) => {
     query.month = Number(month);
     query.year = Number(year);
   }
-  
-  if (status) query.status = status;
+
+  if (status && status !== 'All') {
+    query.status = status;
+  }
+
+  if (search) {
+    query.$or = [
+      { employeeName: { $regex: search, $options: 'i' } },
+      { employeeCode: { $regex: search, $options: 'i' } },
+    ];
+  }
 
   const pageNum = Math.max(1, parseInt(page));
   const limitNum = Math.max(1, parseInt(limit));
@@ -758,200 +561,97 @@ export const getPayrollList = asyncHandler(async (req, res) => {
   const [payrolls, total] = await Promise.all([
     Payroll.find(query)
       .populate('employeeId', 'name employeeCode department position joiningDate panNumber bankName accountNumber ifsc branch')
-      .sort({ employeeCode: 1 })
+      .sort({ employeeCode: 1, fromDate: -1 })
       .skip(skip)
       .limit(limitNum),
-    Payroll.countDocuments(query)
+    Payroll.countDocuments(query),
   ]);
 
   const totalPages = Math.ceil(total / limitNum);
 
-  res.status(200).json(new ApiResponse(200, {
-    payrolls,
-    pagination: { total, page: pageNum, limit: limitNum, totalPages }
-  }, 'Payrolls fetched successfully'));
+  res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        payrolls,
+        pagination: { total, page: pageNum, limit: limitNum, totalPages },
+      },
+      'Payrolls fetched successfully'
+    )
+  );
 });
 
-// ─── GENERATE SALARY SLIP PDF ────────────────────────────────────────────────
+// ─── GET SALARY SLIP PDF ─────────────────────────────────────────────────────
 
 export const getSalarySlip = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const payroll = await Payroll.findById(id).populate('employeeId', 'joiningDate name employeeCode department position panNumber bankName accountNumber ifsc');
-  
+  const payroll = await Payroll.findById(id).populate(
+    'employeeId',
+    'joiningDate name employeeCode department position panNumber bankName accountNumber ifsc branch gender'
+  );
+
   if (!payroll) throw new ApiError(404, 'Payroll record not found');
 
-  const doc = new PDFDocument({ margin: 40, size: 'A4' });
-  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-  
-  // Format dates strictly using UTC to match the stored data regardless of server timezone
-  const formatUTC = (d) => new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(d));
-  
-  const fromStr = formatUTC(payroll.fromDate);
-  const toStr = formatUTC(payroll.toDate);
-  const targetMonthName = months[payroll.month - 1]; // Use the record's target month field
-  const targetYear = payroll.year;
-  
-  const titleText = `${fromStr} - ${toStr} : PAYSLIP FOR THE MONTH OF ${targetMonthName.toUpperCase()} ${targetYear}`;
   const filename = `SalarySlip_${payroll.employeeCode}_${payroll.month}_${payroll.year}.pdf`;
 
+  // 1. If stored on Cloudinary, stream directly using native fetch
+  if (payroll.salarySlipUrl) {
+    try {
+      const response = await fetch(payroll.salarySlipUrl);
+      if (response.ok && response.body) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return Readable.fromWeb(response.body).pipe(res);
+      }
+    } catch (cdnErr) {
+      console.warn('Failed to stream PDF from Cloudinary URL, generating on-the-fly:', cdnErr.message);
+    }
+  }
+
+  // 2. Generate on-the-fly fallback
+  const pdfBuffer = await generateSalarySlipPdfBuffer(payroll);
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(pdfBuffer);
+});
 
-  doc.pipe(res);
+// ─── GET & UPDATE PAYROLL SETTINGS ───────────────────────────────────────────
 
-  // --- BRANDING & HEADER ---
-  const logoPathFront = path.join(__dirname, '../../frontend/src/assets/infinity logo.png');
-  const logoPathBack = path.join(__dirname, '../assets/infinity logo.png');
-  let logoToUse = null;
-  if (fs.existsSync(logoPathFront)) logoToUse = logoPathFront;
-  else if (fs.existsSync(logoPathBack)) logoToUse = logoPathBack;
+export const getPayrollSettings = asyncHandler(async (req, res) => {
+  const settings = await PayrollSettings.getSettings();
+  res.status(200).json(new ApiResponse(200, settings, 'Payroll settings fetched successfully'));
+});
 
-  if (logoToUse) {
-    // Center logo horizontally (A4 width is approx 595. 595/2 - 70 = 227.5)
-    doc.image(logoToUse, 227.5, 30, { width: 140 });
+export const savePayrollSettings = asyncHandler(async (req, res) => {
+  const {
+    ptEnabled,
+    femaleThreshold,
+    femalePtAmount,
+    femaleFebPtAmount,
+    maleMinThreshold,
+    maleMidThreshold,
+    maleMidPtAmount,
+    maleMaxPtAmount,
+    maleFebPtAmount,
+  } = req.body;
+
+  let settings = await PayrollSettings.findOne();
+  if (!settings) {
+    settings = new PayrollSettings({});
   }
 
-  // Move cursor sufficiently below the centered logo
-  doc.y = 110;
-  
-  // --- SALARY SLIP TITLE ---
-  doc.rect(40, doc.y, 515, 25).fill('#f2f2f2');
-  doc.fillColor('#333333').fontSize(11).font('Helvetica-Bold')
-     .text(titleText.toUpperCase(), 40, doc.y + 7, { align: 'center' });
-  doc.fillColor('black');
-  
-  doc.moveDown(2);
+  if (ptEnabled !== undefined) settings.ptEnabled = Boolean(ptEnabled);
+  if (femaleThreshold !== undefined) settings.femaleThreshold = Number(femaleThreshold);
+  if (femalePtAmount !== undefined) settings.femalePtAmount = Number(femalePtAmount);
+  if (femaleFebPtAmount !== undefined) settings.femaleFebPtAmount = Number(femaleFebPtAmount);
+  if (maleMinThreshold !== undefined) settings.maleMinThreshold = Number(maleMinThreshold);
+  if (maleMidThreshold !== undefined) settings.maleMidThreshold = Number(maleMidThreshold);
+  if (maleMidPtAmount !== undefined) settings.maleMidPtAmount = Number(maleMidPtAmount);
+  if (maleMaxPtAmount !== undefined) settings.maleMaxPtAmount = Number(maleMaxPtAmount);
+  if (maleFebPtAmount !== undefined) settings.maleFebPtAmount = Number(maleFebPtAmount);
 
-  // --- EMPLOYEE SUMMARY SECTION ---
-  const startY = doc.y;
-  doc.font('Helvetica');
-  const col1 = 45; const col2 = 150; const col3 = 300; const col4 = 400;
+  settings.updatedBy = req.user._id;
+  await settings.save();
 
-  const formatDate = (dateString) => dateString ? new Date(dateString).toLocaleDateString('en-GB') : 'N/A';
-  
-  doc.fontSize(9).font('Helvetica-Bold').text('Employee Name:', col1, startY);
-  doc.font('Helvetica').text(`${payroll.employeeName || 'N/A'}`, col2, startY);
-  
-  doc.font('Helvetica-Bold').text('Employee ID:', col3, startY);
-  doc.font('Helvetica').text(`${payroll.employeeCode || 'N/A'}`, col4, startY);
-
-  doc.font('Helvetica-Bold').text('Designation:', col1, startY + 20);
-  doc.font('Helvetica').text(`${payroll.employeeId?.position || 'N/A'}`, col2, startY + 20);
-
-  doc.font('Helvetica-Bold').text('Department:', col3, startY + 20);
-  doc.font('Helvetica').text(`${payroll.employeeId?.department || 'N/A'}`, col4, startY + 20);
-  
-  doc.font('Helvetica-Bold').text('Joining Date:', col1, startY + 40);
-  doc.font('Helvetica').text(`${formatDate(payroll.employeeId?.joiningDate)}`, col2, startY + 40);
-
-  doc.font('Helvetica-Bold').text('PAN:', col3, startY + 40);
-  doc.font('Helvetica').text(`${payroll.employeeId?.panNumber || 'N/A'}`, col4, startY + 40);
-
-  doc.font('Helvetica-Bold').text('Bank Name:', col1, startY + 60);
-  doc.font('Helvetica').text(`${payroll.employeeId?.bankName || 'N/A'}`, col2, startY + 60);
-
-  doc.font('Helvetica-Bold').text('Account No:', col3, startY + 60);
-  doc.font('Helvetica').text(`${payroll.employeeId?.accountNumber || 'N/A'}`, col4, startY + 60);
-
-  doc.moveDown(2);
-
-  // --- ATTENDANCE BOX ---
-  let attY = doc.y + 10;
-  doc.rect(40, attY, 515, 45).lineWidth(0.5).stroke('#cccccc');
-  
-  doc.fontSize(8).font('Helvetica-Bold').fillColor('#555555');
-  doc.text('Total Days', 50, attY + 8);
-  doc.text('Paid Days', 130, attY + 8);
-  doc.text('Present', 210, attY + 8);
-  doc.text('Half Days', 290, attY + 8);
-  doc.text('Leaves/Hols', 370, attY + 8);
-  doc.text('Absent/LWP', 450, attY + 8);
-
-  doc.fontSize(10).font('Helvetica').fillColor('black');
-  doc.text(`${payroll.totalDaysInMonth || 0}`, 50, attY + 25);
-  doc.text(`${payroll.paidDays || 0}`, 130, attY + 25);
-  doc.text(`${payroll.presentDays || 0}`, 210, attY + 25);
-  doc.text(`${payroll.halfDays || 0}`, 290, attY + 25);
-  doc.text(`${(payroll.paidLeaves || 0) + (payroll.holidays || 0) + (payroll.weekOffs || 0) - (payroll.sandwichDeductions || 0)}`, 370, attY + 25);
-  doc.text(`${payroll.unpaidLeaves || 0}`, 450, attY + 25);
-
-  doc.moveDown(3);
-
-  // --- EARNINGS & DEDUCTIONS TABLE ---
-  let tableY = doc.y + 10;
-
-  // Table Headers
-  doc.rect(40, tableY, 515, 20).fillAndStroke('#e9ecef', '#cccccc');
-  doc.fillColor('black').font('Helvetica-Bold').fontSize(9);
-  doc.text('EARNINGS', 50, tableY + 6);
-  doc.text('AMOUNT (INR)', 220, tableY + 6, { width: 70, align: 'right' });
-  doc.text('DEDUCTIONS', 310, tableY + 6);
-  doc.text('AMOUNT (INR)', 470, tableY + 6, { width: 70, align: 'right' });
-
-  // Draw central dividing line & outer borders
-  doc.rect(40, tableY, 515, 140).stroke('#cccccc'); // Outer box
-  doc.moveTo(298, tableY).lineTo(298, tableY + 140).stroke('#cccccc'); // Mid vertical
-  doc.moveTo(205, tableY).lineTo(205, tableY + 140).stroke('#cccccc'); // Ear inner
-  doc.moveTo(465, tableY).lineTo(465, tableY + 140).stroke('#cccccc'); // Ded inner
-
-  let rowY = tableY + 25;
-  doc.font('Helvetica').fontSize(9);
-
-  // Earnings Rows
-  let currentGross = parseFloat(payroll.grossEarnings || 0);
-
-  doc.text('Basic Salary', 50, rowY);
-  doc.text(`${currentGross.toFixed(2)}`, 220, rowY, { width: 70, align: 'right' });
-
-  // Deductions Rows
-  let pt = parseFloat(payroll.professionalTax || 0);
-  let otherDed = parseFloat(payroll.otherDeductions || 0);
-
-  doc.text('Professional Tax', 310, rowY);
-  doc.text(`${pt.toFixed(2)}`, 470, rowY, { width: 70, align: 'right' });
-
-  if (otherDed > 0) {
-    doc.text('Other Deductions', 310, rowY + 18);
-    doc.text(`${otherDed.toFixed(2)}`, 470, rowY + 18, { width: 70, align: 'right' });
-  }
-
-  // Draw Total separator
-  doc.moveTo(40, tableY + 120).lineTo(555, tableY + 120).stroke('#cccccc');
-  
-  // Totals Line
-  doc.font('Helvetica-Bold');
-  let totEY = tableY + 125;
-  doc.text('Total Earnings', 50, totEY);
-  doc.text(`${currentGross.toFixed(2)}`, 220, totEY, { width: 70, align: 'right' });
-  
-  let totDed = pt + otherDed;
-  doc.text('Total Deductions', 310, totEY);
-  doc.text(`${totDed.toFixed(2)}`, 470, totEY, { width: 70, align: 'right' });
-
-  // NET SALARY HIGHLIGHT
-  let netY = tableY + 160;
-  doc.rect(40, netY, 515, 30).fillAndStroke('#eef9f2', '#b2d9c0');
-  doc.fillColor('#1f7035').fontSize(11);
-  doc.text('Net Amount Payable:', 50, netY + 10);
-  doc.fontSize(12).text(`INR ${parseFloat(payroll.netSalary || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 400, netY + 9, { width: 140, align: 'right' });
-  
-  // NET SALARY IN WORDS
-  doc.fillColor('black').font('Helvetica').fontSize(9);
-  doc.text(`Amount In Words: Rupees ${convertNumberToWords(Math.round(payroll.netSalary || 0))} Only`, 40, netY + 40);
-
-  if (payroll.sandwichDeductions > 0) {
-    doc.fillColor('#ef4444').font('Helvetica-Bold').fontSize(8);
-    doc.text(`Note: ${payroll.sandwichDeductions} day(s) of Sandwich Leave Deduction applied.`, 40, netY + 55);
-    doc.fillColor('black');
-  }
-
-  // --- FOOTER & SIGNATURE ---
-  let footY = doc.y + 60;
-  
-  // Disclaimer
-  doc.rect(40, footY, 515, 0).stroke('#cccccc');
-  doc.font('Helvetica').fontSize(8).fillColor('gray');
-  doc.text('This is a computer generated document and does not require a physical signature.', 40, footY + 10, { align: 'center' });
-
-  doc.end();
+  res.status(200).json(new ApiResponse(200, settings, 'Payroll settings saved successfully'));
 });

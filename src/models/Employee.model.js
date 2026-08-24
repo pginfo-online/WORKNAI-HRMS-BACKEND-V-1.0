@@ -2,6 +2,14 @@ import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { config } from '../config/index.js';
 
+/**
+ * Employee — core identity, auth, and job information only.
+ *
+ * Extended data lives in separate models:
+ *   - EmployeeDocument   (docs, verification)
+ *   - EmployeeBankDetails (bank account)
+ *   - LeaveBalance        (paid leave, comp-off)
+ */
 const employeeSchema = new mongoose.Schema(
   {
     // ── EMPLOYEE CODE ──
@@ -11,139 +19,99 @@ const employeeSchema = new mongoose.Schema(
       unique: true,
       uppercase: true,
       trim: true,
-      match: /^WA\d{5}$/,
+      match: /^[A-Z]{2}\d{5}$/,
+      index: true,
     },
 
+    // ── AUTH ──
+    password: { type: String, required: true, minlength: 6, select: false },
+    refreshToken: { type: String, select: false },
+
     // ── ACCOUNT ──
-    password: { type: String, required: true, minlength: 6 },
     role: {
       type: String,
       required: true,
-      enum: ['SuperUser', 'HR', 'Manager', 'Director', 'VP', 'GM', 'Employee', 'Intern' , "fresher"],
+      enum: ['SuperUser', 'HR', 'Manager', 'Director', 'VP', 'GM', 'Employee', 'Intern'],
       default: 'Employee',
+      index: true,
     },
-    status: { type: String, enum: ['Active', 'Inactive'], default: 'Active' },
-    deactivateReason: { type: String },
+    status: {
+      type: String,
+      enum: ['Active', 'Inactive'],
+      default: 'Active',
+      index: true,
+    },
+    deactivateReason: { type: String, trim: true },
+    lastWorkingDate: { type: Date },
 
-    // ── BASIC DETAILS ──
+    // ── CORE PERSONAL ──
     name: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true,
+    },
     mobileNumber: { type: String, required: true, trim: true },
     alternateMobileNumber: { type: String, trim: true },
     gender: { type: String, enum: ['Male', 'Female', 'Other'] },
-    bloodGroup: { type: String, enum: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'] },
     dateOfBirth: { type: Date },
+    bloodGroup: { type: String, enum: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'] },
     maritalStatus: { type: String, enum: ['Single', 'Married', 'Divorced', 'Widowed'] },
-    profileImageUrl: { type: String }, // Cloudinary URL
-    faceDescriptor: { type: [Number] }, // For storing face-api.js array descriptor
 
-    // ── PERSONAL DETAILS ──
+    profileImageUrl: { type: String }, // Cloudinary URL
+
+    // ── OPTIONAL PERSONAL ──
     fatherName: { type: String, trim: true },
     motherName: { type: String, trim: true },
-    currentAddress: { type: String },
-    permanentAddress: { type: String },
-    district: { type: String },
-    state: { type: String },
-    pincode: { type: String },
+    currentAddress: { type: String, trim: true },
+    permanentAddress: { type: String, trim: true },
+    district: { type: String, trim: true },
+    state: { type: String, trim: true },
+    pincode: { type: String, trim: true },
+
+    // ── EMERGENCY CONTACT ──
+    emergencyContactName: { type: String, trim: true },
+    emergencyContactRelationship: { type: String, trim: true },
+    emergencyContactMobile: { type: String, trim: true },
+    emergencyContactAddress: { type: String, trim: true },
 
     // ── JOB DETAILS ──
     joiningDate: { type: Date },
     department: { type: String, trim: true },
     position: { type: String, trim: true },
-    salary: { type: Number },
-    reportingManagers: [String],
+    salary: { type: Number, min: 0 },
+    reportingManagers: [{ type: String }],
     managerIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Employee' }],
 
     // ── EXPERIENCE ──
-    experienceType: { type: String, enum: ['Fresher', 'Experienced' ] },
-    totalExperienceYears: { type: Number },
-    lastCompanyName: { type: String },
-    experienceCertificateUrl: { type: String }, // Cloudinary URL
+    experienceType: { type: String, enum: ['Fresher', 'Experienced'] },
+    totalExperienceYears: { type: Number, min: 0 },
+    lastCompanyName: { type: String, trim: true },
 
     // ── EDUCATION ──
     hscPercent: { type: Number },
-    graduationCourse: { type: String },
+    graduationCourse: { type: String, trim: true },
     graduationPercent: { type: Number },
-    postGraduationCourse: { type: String },
+    postGraduationCourse: { type: String, trim: true },
     postGraduationPercent: { type: Number },
 
-    // ── DOCS (Cloudinary URLs) ──
-    aadhaarNumber: { type: String },
-    panNumber: { type: String },
-    aadhaarFileUrl: { type: String },
-    panFileUrl: { type: String },
-    passbookFileUrl: { type: String },
-    tenthMarksheetUrl: { type: String },
-    twelfthMarksheetUrl: { type: String },
-    graduationMarksheetUrl: { type: String },
-    postGraduationMarksheetUrl: { type: String },
-    medicalDocumentUrl: { type: String },
-
-    // ── BANK DETAILS ──
-    accountHolderName: { type: String },
-    bankName: { type: String },
-    accountNumber: { type: String },
-    ifsc: { type: String },
-    branch: { type: String },
-    bankVerified: { type: Boolean, default: false },
-    bankVerifiedDate: { type: Date },
-
-    // ── VERIFICATION ──
-    aadhaarVerified: { type: Boolean, default: false },
-    panVerified: { type: Boolean, default: false },
-    aadhaarVerifiedDate: { type: Date },
-    panVerifiedDate: { type: Date },
-
-    // ── EMERGENCY CONTACT ──
-    emergencyContactName: { type: String },
-    emergencyContactRelationship: { type: String },
-    emergencyContactMobile: { type: String },
-    emergencyContactAddress: { type: String },
-
-    // ── HEALTH ──
+    // ── HEALTH (minimal) ──
     hasDisease: { type: String, enum: ['Yes', 'No'], default: 'No' },
-    diseaseName: { type: String },
-    diseaseType: { type: String },
-    diseaseSince: { type: String },
-    medicinesRequired: { type: String },
-    doctorName: { type: String },
-    doctorContact: { type: String },
+    diseaseName: { type: String, trim: true },
 
-    // ── LEAVE BALANCES ──
-    compOffBalance: { type: Number, default: 0 },
-    paidLeaveBalance: { type: Number, default: 0 },
-    lastLeaveAccrualDate: { type: Date },
-    leaveBalanceHistory: [
-      {
-        type: {
-          type: String,
-          enum: ['Accrual', 'Deduction', 'Adjustment', 'Reset', 'CarryOver'],
-          required: true,
-        },
-        leaveType: { type: String, enum: ['Paid', 'CompOff'], required: true },
-        amount: { type: Number, required: true },
-        previousBalance: { type: Number, required: true },
-        newBalance: { type: Number, required: true },
-        remarks: { type: String },
-        timestamp: { type: Date, default: Date.now },
-        // Canonical month key (e.g. "2026-04") — used by leave cron for idempotent dedup
-        accrualMonthKey: { type: String },
-        earnedDate: { type: Date }, // For Comp-Off tracking
-        expiryDate: { type: Date }, // For Comp-Off tracking
-        isUsed: { type: Boolean, default: false }, // For Comp-Off tracking
-        usedDate: { type: Date }, // For Comp-Off tracking
-      },
-    ],
-    lastWorkingDate: { type: Date },
-
-    // ── REFRESH TOKENS ──
-    refreshToken: { type: String },
-
-    // ── NOTIFICATIONS ──
-    fcmToken: { type: String },
+    // ── GEO BYPASS ──
+    // If true, this employee skips geo validation (set per-employee instead of hardcoded code)
+    geoBypass: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
+
+// ── INDEXES ──
+employeeSchema.index({ department: 1 });
+employeeSchema.index({ role: 1, status: 1 });
 
 // ── HASH PASSWORD BEFORE SAVE ──
 employeeSchema.pre('save', async function (next) {
@@ -162,11 +130,11 @@ employeeSchema.statics.generateNextCode = async function () {
   const prefix = config.company.prefix;
   const last = await this.findOne({}, { employeeCode: 1 }).sort({ employeeCode: -1 });
   if (!last) return `${prefix}00001`;
-  const num = parseInt(last.employeeCode.substring(prefix.length)) + 1;
+  const num = parseInt(last.employeeCode.substring(prefix.length), 10) + 1;
   return `${prefix}${String(num).padStart(5, '0')}`;
 };
 
-// ── HIDE SENSITIVE FIELDS ──
+// ── SAFE OBJECT (no sensitive fields) ──
 employeeSchema.methods.toSafeObject = function () {
   const obj = this.toObject();
   delete obj.password;

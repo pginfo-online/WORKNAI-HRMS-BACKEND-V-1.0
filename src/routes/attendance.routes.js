@@ -5,49 +5,33 @@ import {
   trackLocation,
   getTodayStatus,
   getMySummary,
-  getAdminAttendanceList,
-  markReportAsRead,
+  getAttendanceList,
   requestCorrection,
   approveCorrection,
-  rejectCorrection,
   getPendingCorrections,
-  getAttendanceByDate,
-  getCorrectionHistoryMonthWise,
+  getEmployeeAttendanceSummary,
 } from '../controllers/attendance.controller.js';
 import { verifyJWT } from '../middleware/auth.middleware.js';
-import { authorizeRoles, MANAGEMENT_ROLES } from '../middleware/role.middleware.js';
+import { requireRole, MANAGEMENT_ROLES } from '../middleware/role.middleware.js';
 
 const router = Router();
 
-// All authenticated routes
 router.use(verifyJWT);
 
+// ── EMPLOYEE SELF-SERVICE ──
 router.post('/check-in', checkIn);
 router.post('/check-out', checkOut);
 router.post('/track', trackLocation);
 router.get('/today', getTodayStatus);
 router.get('/my-summary', getMySummary);
 
-// Admin / Management only
-router.get('/admin', authorizeRoles(...MANAGEMENT_ROLES, 'Manager'), getAdminAttendanceList);
-router.patch('/mark-read/:id', authorizeRoles(...MANAGEMENT_ROLES, 'Manager'), markReportAsRead);
+// ── CORRECTION ──
+router.post('/correction', requestCorrection);
+router.get('/corrections/pending', requireRole([...MANAGEMENT_ROLES, 'Manager']), getPendingCorrections);
+router.patch('/correction/:id', requireRole([...MANAGEMENT_ROLES, 'Manager']), approveCorrection);
 
-// ── CORRECTION ROUTES ──
-router.post('/correction/:id', requestCorrection);
-router.get('/corrections/pending', authorizeRoles(...MANAGEMENT_ROLES, 'Manager'), getPendingCorrections);
-router.patch('/correction-approve/:id', authorizeRoles(...MANAGEMENT_ROLES, 'Manager'), approveCorrection);
-router.patch('/correction-reject/:id', authorizeRoles(...MANAGEMENT_ROLES, 'Manager'), rejectCorrection);
-
-
-// -------  attendance details for the selecte date
-router.get('/employee-attendance', authorizeRoles(...MANAGEMENT_ROLES, 'Manager'), getAttendanceByDate);
-
-// -------- attedance history details month wise --
-
-
-router.get('/correction-history' , authorizeRoles(...MANAGEMENT_ROLES, 'Manager') , getCorrectionHistoryMonthWise)
-
+// ── ADMIN / HR ──
+router.get('/list', requireRole([...MANAGEMENT_ROLES, 'Manager']), getAttendanceList);
+router.get('/employee/:employeeId', requireRole([...MANAGEMENT_ROLES, 'Manager']), getEmployeeAttendanceSummary);
 
 export default router;
-
-

@@ -1,8 +1,8 @@
 import { Employee } from '../models/Employee.model.js';
 import { Attendance } from '../models/Attendance.model.js';
 import { Leave } from '../models/Leave.model.js';
+import { LeaveBalance } from '../models/LeaveBalance.model.js';
 import { Holiday } from '../models/Holiday.model.js';
-import { Announcement } from '../models/Announcement.model.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { ApiResponse } from '../utils/ApiResponse.js';
 
@@ -84,7 +84,7 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
     { $group: { _id: '$gender', count: { $sum: 1 } } }
   ]);
 
-  // 6. Recent Employee Activities (Last 5 New Joiners or Updates)
+  // 6. Recent Employee Activities
   const recentEmployees = await Employee.find({ status: 'Active' })
     .sort({ createdAt: -1 })
     .limit(5)
@@ -143,7 +143,6 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
     { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } }
   ]);
 
-  // Ensure all 7 days are present in the trend
   const formattedTrends = last7Days.map(date => {
     const found = attendanceTrends.find(t => {
       const d = new Date(t.actualDate);
@@ -173,17 +172,13 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
     { $sort: { '_id.year': 1, '_id.month': 1 } }
   ]);
 
-  // 10. Employees Without Attendance Today (Active but no record or status 'A')
-  // First get all active employees
+  // 10. Absent Employees
   const allActiveEmps = await Employee.find({ status: 'Active' }).select('_id name employeeCode');
-  
-  // Get IDs of employees who are Present, on Leave, or it's their Week Off/Holiday
   const accountedEmpIds = await Attendance.find({ 
     date: { $gte: today, $lte: todayEnd }, 
     status: { $in: ['P', 'Coff', 'H', 'WO', 'L', 'AUTO'] } 
   }).distinct('employeeId');
 
-  // Also get IDs of employees who have an approved leave today (in case attendance record isn't synced yet)
   const onLeaveEmpIds = leavesToday.map(l => l.employeeId?._id?.toString());
 
   const absentEmps = allActiveEmps.filter(emp => {
@@ -206,7 +201,7 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
       wfh: wfhToday,
       field: fieldToday,
       presentEmployeesList: presentEmployees,
-      absentEmployees: absentEmps.slice(0, 10) // Limit to 10 for quick view
+      absentEmployees: absentEmps.slice(0, 10)
     },
     leaveStats: {
       onLeaveToday: leavesToday.length,
@@ -227,15 +222,13 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
   }, 'HR Dashboard stats fetched successfully'));
 });
 
-// ─── EMPLOYEE DASHBOARD STATS (NEW UNIFIED API) ──────────────────────────────
+// ─── EMPLOYEE DASHBOARD STATS ────────────────────────────────────────────────
 export const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
   const employeeId = req.user._id;
   const today = startOfDay();
   const todayEnd = endOfDay();
   const currentMonthStart = startOfMonth();
-  const now = new Date();
 
-  // Concurrent Optimized Database Queries
   const [
     todayRecord,
     monthlySummary,
@@ -243,8 +236,7 @@ export const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
     tomorrowBirthdays,
     upcomingHolidays,
     pendingLeavesCount,
-    employeeInfo,
-    announcements
+    leaveBalance
   ] = await Promise.all([
     // 1. Today's Attendance Record
     Attendance.findOne({
@@ -252,7 +244,7 @@ export const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
       date: { $gte: today, $lte: todayEnd }
     }),
 
-    // 2. Monthly Summary aggregation (only for the current month)
+    // 2. Monthly Summary aggregation
     Attendance.aggregate([
       {
         $match: {
@@ -307,30 +299,10 @@ export const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
       overallStatus: 'Pending'
     }),
 
-    // 7. Fresh Employee balances
-    Employee.findById(employeeId).select('paidLeaveBalance compOffBalance'),
-
-    // 8. Active Targeted Announcements (Notice Board)
-    Announcement.find({
-      isActive: true,
-      $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-      $and: [
-        {
-          $or: [
-            { targetType: 'All' },
-            { targetType: 'Department', targetDepartments: req.user.department },
-            { targetType: 'Role', targetRoles: req.user.role },
-            { targetType: 'Employee', targetEmployees: employeeId },
-          ]
-        }
-      ]
-    })
-      .populate('createdBy', 'name role profileImageUrl')
-      .sort({ priority: -1, createdAt: -1 })
-      .limit(3)
+    // 7. Leave Balance from LeaveBalance model
+    LeaveBalance.findOne({ employeeId }).select('paidLeaveBalance compOffBalance'),
   ]);
 
-  // Format monthly stats safely
   const stats = monthlySummary[0] || { present: 0, absent: 0, late: 0, totalHours: 0 };
 
   res.json(
@@ -350,14 +322,12 @@ export const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
         },
         upcomingHolidays,
         leaveSummary: {
-          paidLeaveBalance: employeeInfo?.paidLeaveBalance || 0,
-          compOffBalance: employeeInfo?.compOffBalance || 0,
+          paidLeaveBalance: leaveBalance?.paidLeaveBalance || 0,
+          compOffBalance: leaveBalance?.compOffBalance || 0,
           pendingLeavesCount
         },
-        announcements
       },
       'Employee Dashboard stats fetched successfully'
     )
   );
 });
-
