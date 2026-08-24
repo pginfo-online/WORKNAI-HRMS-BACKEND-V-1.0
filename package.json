@@ -9,8 +9,7 @@
   },
   "scripts": {
     "dev": "nodemon server.js",
-    "start": "node server.js",
-    "export-db": "node src/scripts/export-data.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
