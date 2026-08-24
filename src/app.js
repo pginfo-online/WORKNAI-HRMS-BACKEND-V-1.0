@@ -4,7 +4,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 
-import { connectDB } from './config/db.js';
+import connectDB from './config/db.js';
 import { logger } from './utils/logger.js';
 import { errorHandler, notFoundHandler } from './middleware/error.middleware.js';
 
@@ -31,12 +31,15 @@ const getAllowedOrigins = () => {
   const origins = [
     'http://localhost:5173',
     'http://localhost:5174',
+    'http://localhost:3000',
     process.env.FRONTEND_URL,
     process.env.ADDITIONAL_ALLOWED_ORIGINS,
   ].filter(Boolean);
 
-  // Support comma-separated list in ADDITIONAL_ALLOWED_ORIGINS
-  return origins.flatMap((o) => o.split(',').map((s) => s.trim()));
+  // Support comma-separated list in origins and strip trailing slashes
+  return origins
+    .flatMap((o) => o.split(',').map((s) => s.trim()))
+    .map((o) => o.replace(/\/+$/, ''));
 };
 
 const corsOptions = {
@@ -44,11 +47,12 @@ const corsOptions = {
     if (!origin || process.env.NODE_ENV === 'development') {
       return callback(null, true);
     }
-    if (getAllowedOrigins().includes(origin)) {
+    const normalizedOrigin = origin.replace(/\/+$/, '');
+    if (getAllowedOrigins().includes(normalizedOrigin)) {
       return callback(null, true);
     }
     logger.warn(`CORS blocked: ${origin}`);
-    callback(new Error('Not allowed by CORS policy'));
+    callback(new Error(`Not allowed by CORS policy: ${origin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -78,17 +82,20 @@ if (process.env.NODE_ENV !== 'production') {
 // HEALTH CHECK
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => {
+const healthCheckHandler = (req, res) => {
   res.json(
     new ApiResponse(200, {
       status: 'ok',
       timestamp: new Date().toISOString(),
       service: 'WorknAI HRMS API',
       version: '3.0.0',
-      env: process.env.NODE_ENV,
+      env: process.env.NODE_ENV || 'development',
     }, 'Service healthy')
   );
-});
+};
+
+app.get('/health', healthCheckHandler);
+app.get('/', healthCheckHandler);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API ROUTES
@@ -116,24 +123,5 @@ app.use(notFoundHandler);
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.use(errorHandler);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// START SERVER (non-Vercel)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const PORT = process.env.PORT || 5000;
-
-if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
-  connectDB()
-    .then(() => {
-      app.listen(PORT, () => {
-        logger.info(`🚀 WorknAI HRMS API running on port ${PORT}`);
-      });
-    })
-    .catch((err) => {
-      logger.error('❌ Failed to connect to database', err);
-      process.exit(1);
-    });
-}
 
 export default app;

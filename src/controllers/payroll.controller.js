@@ -123,7 +123,10 @@ export const processSingleEmployeePayroll = async ({
   // ── FETCH ATTENDANCE, HOLIDAYS & APPROVED LEAVES ──
   const [attendanceRecords, holidayRecords, approvedLeaves] = await Promise.all([
     Attendance.find({
-      employeeId,
+      $or: [
+        { employeeId },
+        { employeeCode: employee.employeeCode },
+      ],
       date: { $gte: extendedFromDate, $lte: extendedToDate },
     }),
     Holiday.find({
@@ -151,8 +154,37 @@ export const processSingleEmployeePayroll = async ({
   const presentDayDetails = [];
 
   const getUTCDateStr = (date) => {
+    if (!date) return '';
     const d = new Date(date);
+    if (isNaN(d.getTime())) return '';
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  };
+
+  const getLocalDateStr = (date) => {
+    if (!date) return '';
+    const d = new Date(date);
+    if (isNaN(d.getTime())) return '';
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+
+  const matchesDate = (dateObj, targetStr) => {
+    if (!dateObj) return false;
+    const u = getUTCDateStr(dateObj);
+    const l = getLocalDateStr(dateObj);
+    return u === targetStr || l === targetStr;
+  };
+
+  const normalizeStatus = (statusStr) => {
+    if (!statusStr) return '';
+    const s = String(statusStr).trim().toUpperCase();
+    if (s === 'P' || s === 'PRESENT' || s === 'AUTO') return 'P';
+    if (s === 'HALF' || s === 'HALF DAY' || s === 'HALF-DAY') return 'Half';
+    if (s === 'COFF' || s === 'COMP-OFF' || s === 'COMPOFF') return 'Coff';
+    if (s === 'WO' || s === 'WEEK OFF' || s === 'WEEKOFF' || s === 'WEEKLY OFF') return 'WO';
+    if (s === 'H' || s === 'HOLIDAY') return 'H';
+    if (s === 'A' || s === 'ABSENT') return 'A';
+    if (s === 'L' || s === 'LEAVE') return 'L';
+    return s;
   };
 
   // ── 1. SANDWICH CACHE HELPER ──
@@ -162,32 +194,38 @@ export const processSingleEmployeePayroll = async ({
     const dStr = getUTCDateStr(d);
     if (statusCache[dStr]) return statusCache[dStr];
 
-    const isSunday = d.getUTCDay() === 0;
-    const isHolid = holidayRecords.some((h) => getUTCDateStr(h.date) === dStr);
+    const record = attendanceRecords.find((r) => matchesDate(r.date, dStr));
+    const recordNormStatus = record ? normalizeStatus(record.status) : '';
 
-    if (isSunday || isHolid) {
-      statusCache[dStr] = 'WO_HOLIDAY';
-      return 'WO_HOLIDAY';
-    }
-
-    const record = attendanceRecords.find((r) => getUTCDateStr(r.date) === dStr);
-
-    // Only physical work or credited comp-off breaks the sandwich
-    if (record && ['P', 'Half', 'Coff'].includes(record.status)) {
-      if (record.status === 'Coff') {
+    // Physical work (including on Sunday / Week-Off / Holiday) takes precedence and breaks sandwich
+    if (record && (['P', 'Half', 'Coff'].includes(recordNormStatus) || record.inTime)) {
+      if (recordNormStatus === 'Coff') {
         statusCache[dStr] = 'PRESENT';
         return 'PRESENT';
       }
       const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
-      const evalResult = evaluateWorkingMinutes(d, workedMins);
-
-      if (evalResult.isFullDay && record.status !== 'Half') {
+      if (workedMins > 0) {
+        const evalResult = evaluateWorkingMinutes(d, workedMins);
+        if (evalResult.isFullDay && recordNormStatus !== 'Half') {
+          statusCache[dStr] = 'PRESENT';
+          return 'PRESENT';
+        } else if (evalResult.isHalfDay || recordNormStatus === 'Half') {
+          statusCache[dStr] = 'HALF';
+          return 'HALF';
+        }
+      } else if (recordNormStatus === 'P' || record.inTime) {
         statusCache[dStr] = 'PRESENT';
         return 'PRESENT';
-      } else if (evalResult.isHalfDay || record.status === 'Half') {
-        statusCache[dStr] = 'HALF';
-        return 'HALF';
       }
+    }
+
+    const isSunday = d.getUTCDay() === 0 || d.getDay() === 0;
+    const isHolid = recordNormStatus === 'H' || holidayRecords.some((h) => matchesDate(h.date, dStr));
+    const isWeekOff = isSunday || recordNormStatus === 'WO';
+
+    if (isWeekOff || isHolid) {
+      statusCache[dStr] = 'WO_HOLIDAY';
+      return 'WO_HOLIDAY';
     }
 
     statusCache[dStr] = 'LEAVE_ABSENT';
@@ -251,11 +289,58 @@ export const processSingleEmployeePayroll = async ({
       continue;
     }
 
-    const record = attendanceRecords.find((r) => getUTCDateStr(r.date) === dStr);
-    const isSunday = current.getUTCDay() === 0;
-    const isHolid = holidayRecords.some((h) => getUTCDateStr(h.date) === dStr);
+    const record = attendanceRecords.find((r) => matchesDate(r.date, dStr));
+    const recordNormStatus = record ? normalizeStatus(record.status) : '';
+    const isSunday = current.getUTCDay() === 0 || current.getDay() === 0;
+    const isWeekOff = isSunday || recordNormStatus === 'WO';
+    const isHolid = recordNormStatus === 'H' || holidayRecords.some((h) => matchesDate(h.date, dStr));
 
-    if (isSunday) {
+    const hasPhysicalWork = record && (['P', 'Half', 'Coff'].includes(recordNormStatus) || record.inTime);
+
+    if (hasPhysicalWork) {
+      if (recordNormStatus === 'Coff') {
+        summary.present++;
+        presentDayDetails.push({ date: new Date(current), reason: 'Compensatory Off (Coff)' });
+      } else {
+        const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
+
+        if (workedMins > 0) {
+          const evalResult = evaluateWorkingMinutes(current, workedMins);
+
+          if (evalResult.isFullDay && recordNormStatus !== 'Half') {
+            summary.present++;
+            presentDayDetails.push({
+              date: new Date(current),
+              reason: `Full Present${isWeekOff ? ' (Worked on Week-Off)' : isHolid ? ' (Worked on Holiday)' : ''}: Worked ${(record.totalHours || workedMins / 60).toFixed(2)} hrs`,
+            });
+          } else if (evalResult.isHalfDay || recordNormStatus === 'Half') {
+            summary.half++;
+            halfDayDetails.push({
+              date: new Date(current),
+              reason: `Half Day${isWeekOff ? ' (Worked on Week-Off)' : ''}: Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs`,
+            });
+          } else if (isWeekOff) {
+            summary.weekOff++;
+            presentDayDetails.push({
+              date: new Date(current),
+              reason: `Weekly Off (Attended ${workedMins} min)`,
+            });
+          } else {
+            summary.absent++;
+            absentDayDetails.push({
+              date: new Date(current),
+              reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Below threshold)`,
+            });
+          }
+        } else {
+          summary.present++;
+          presentDayDetails.push({
+            date: new Date(current),
+            reason: `Present${isWeekOff ? ' (Worked on Week-Off)' : ''} (Check-in / Status Marked)`,
+          });
+        }
+      }
+    } else if (isWeekOff) {
       summary.weekOff++;
       if (isSandwiched(current)) {
         sandwichDetails.push({ date: new Date(current), reason: 'Weekly Off (Sandwiched)' });
@@ -263,7 +348,7 @@ export const processSingleEmployeePayroll = async ({
     } else if (isHolid) {
       summary.holiday++;
       if (isSandwiched(current)) {
-        const matchingHol = holidayRecords.find((h) => getUTCDateStr(h.date) === dStr);
+        const matchingHol = holidayRecords.find((h) => matchesDate(h.date, dStr));
         sandwichDetails.push({ date: new Date(current), reason: `Holiday (${matchingHol?.name || 'Public'}) (Sandwiched)` });
       }
     } else {
@@ -275,32 +360,50 @@ export const processSingleEmployeePayroll = async ({
       });
 
       // 2. Physical work takes precedence over leave application
-      if (record && ['P', 'Half', 'Coff'].includes(record.status)) {
-        if (record.status === 'Coff') {
+      if (record && (['P', 'Half', 'Coff'].includes(recordNormStatus) || record.inTime)) {
+        if (recordNormStatus === 'Coff') {
           summary.present++;
           presentDayDetails.push({ date: new Date(current), reason: 'Compensatory Off (Coff)' });
         } else {
           const workedMins = record.totalMinutes || Math.round((record.totalHours || 0) * 60);
-          const evalResult = evaluateWorkingMinutes(current, workedMins);
 
-          if (evalResult.isFullDay && record.status !== 'Half') {
-            summary.present++;
-            presentDayDetails.push({
-              date: new Date(current),
-              reason: `Full Present: Worked ${(record.totalHours || workedMins / 60).toFixed(2)} hrs`,
-            });
-          } else if (evalResult.isHalfDay || record.status === 'Half') {
-            summary.half++;
-            halfDayDetails.push({
-              date: new Date(current),
-              reason: `Half Day: Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Req: ${evalResult.requiredFullMinutes} min)`,
-            });
+          if (workedMins > 0) {
+            const evalResult = evaluateWorkingMinutes(current, workedMins);
+
+            if (evalResult.isFullDay && recordNormStatus !== 'Half') {
+              summary.present++;
+              presentDayDetails.push({
+                date: new Date(current),
+                reason: `Full Present: Worked ${(record.totalHours || workedMins / 60).toFixed(2)} hrs`,
+              });
+            } else if (evalResult.isHalfDay || recordNormStatus === 'Half') {
+              summary.half++;
+              halfDayDetails.push({
+                date: new Date(current),
+                reason: `Half Day: Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Req: ${evalResult.requiredFullMinutes} min)`,
+              });
+            } else {
+              summary.absent++;
+              absentDayDetails.push({
+                date: new Date(current),
+                reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Below threshold)`,
+              });
+            }
           } else {
-            summary.absent++;
-            absentDayDetails.push({
-              date: new Date(current),
-              reason: `Worked ${record.totalHours || (workedMins / 60).toFixed(2)} hrs (Below threshold)`,
-            });
+            // Check-in recorded or status 'P' without closed totalMinutes
+            if (recordNormStatus === 'Half') {
+              summary.half++;
+              halfDayDetails.push({
+                date: new Date(current),
+                reason: 'Half Day (Status Marked)',
+              });
+            } else {
+              summary.present++;
+              presentDayDetails.push({
+                date: new Date(current),
+                reason: 'Present (Check-in / Status Marked)',
+              });
+            }
           }
         }
       }
@@ -371,7 +474,7 @@ export const processSingleEmployeePayroll = async ({
 
   // ── 5. PERSIST TO DATABASE ──
   const savedPayroll = await Payroll.findOneAndUpdate(
-    { employeeId, month: targetMonth, year: targetYear },
+    { employeeId, fromDate, toDate },
     {
       employeeCode: employee.employeeCode,
       employeeName: employee.name,
@@ -533,10 +636,11 @@ export const getPayrollList = asyncHandler(async (req, res) => {
   // Date Range or Month/Year Filter
   if (startDate && endDate) {
     const start = new Date(`${startDate}T00:00:00Z`);
+    const startBuffer = new Date(start);
+    startBuffer.setUTCDate(startBuffer.getUTCDate() - 1);
     const end = new Date(`${endDate}T23:59:59Z`);
     if (!isNaN(start.getTime()) && !isNaN(end.getTime())) {
-      query.fromDate = { $lte: end };
-      query.toDate = { $gte: start };
+      query.fromDate = { $gte: startBuffer, $lte: end };
     }
   } else if (month && year) {
     query.month = Number(month);
@@ -561,7 +665,7 @@ export const getPayrollList = asyncHandler(async (req, res) => {
   const [payrolls, total] = await Promise.all([
     Payroll.find(query)
       .populate('employeeId', 'name employeeCode department position joiningDate panNumber bankName accountNumber ifsc branch')
-      .sort({ employeeCode: 1, fromDate: -1 })
+      .sort({ employeeCode: 1, updatedAt: -1, fromDate: -1 })
       .skip(skip)
       .limit(limitNum),
     Payroll.countDocuments(query),
