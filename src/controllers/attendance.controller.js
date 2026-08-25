@@ -92,8 +92,6 @@ export const checkIn = asyncHandler(async (req, res) => {
     existing.status = 'P';
     existing.isLate = isLate;
     existing.lateMinutes = lateMinutes;
-    existing.correctionRequested = false;
-    existing.correctionStatus = 'None';
     existing.locationHistory = locationEntry;
     attendance = await existing.save();
   } else {
@@ -403,8 +401,14 @@ export const getAttendanceList = asyncHandler(async (req, res) => {
 
 // ─── CORRECTION REQUEST ───────────────────────────────────────────────────────
 
+// ─── CORRECTION REQUEST ───────────────────────────────────────────────────────
+
 export const requestCorrection = asyncHandler(async (req, res) => {
   const { attendanceId, requestedInTime, requestedOutTime, correctionReason, correctionProofUrl } = req.body;
+
+  if (!requestedInTime && !requestedOutTime) {
+    throw new ApiError(400, 'Please provide at least a requested check-in or check-out time');
+  }
 
   const attendance = await Attendance.findById(attendanceId);
   if (!attendance) throw new ApiError(404, 'Attendance record not found');
@@ -412,12 +416,13 @@ export const requestCorrection = asyncHandler(async (req, res) => {
     throw new ApiError(403, 'You can only request correction for your own attendance');
   }
   if (attendance.correctionStatus === 'Pending_HR' || attendance.correctionStatus === 'Pending_GM') {
-    throw new ApiError(400, 'A correction request is already pending');
+    throw new ApiError(400, 'A correction request is already pending for this date');
   }
 
   attendance.correctionRequested = true;
   attendance.correctionStatus = 'Pending_HR';
   attendance.correctionReason = correctionReason;
+  attendance.correctionCount = (attendance.correctionCount || 0) + 1;
   if (correctionProofUrl) attendance.correctionProofUrl = correctionProofUrl;
   attendance.correctionRequestedOn = new Date();
   if (requestedInTime) attendance.requestedInTime = new Date(requestedInTime);
@@ -435,12 +440,28 @@ export const requestCorrection = asyncHandler(async (req, res) => {
   res.status(200).json(new ApiResponse(200, attendance, 'Correction request submitted to HR'));
 });
 
+// ─── GET MY CORRECTION HISTORY ───────────────────────────────────────────────
+
+export const getMyCorrectionHistory = asyncHandler(async (req, res) => {
+  const records = await Attendance.find({
+    employeeCode: req.user.employeeCode,
+    correctionRequested: true,
+  })
+    .sort({ correctionRequestedOn: -1 })
+    .lean();
+
+  res.status(200).json(new ApiResponse(200, records, 'My correction requests history fetched'));
+});
+
 // ─── GET PENDING CORRECTIONS (HR / ADMIN) ─────────────────────────────────────
 
 export const getPendingCorrections = asyncHandler(async (req, res) => {
   const { page = 1, limit = 20, employeeCode } = req.query;
 
-  const filter = { correctionRequested: true };
+  const filter = {
+    correctionRequested: true,
+    correctionStatus: { $in: ['Pending_HR', 'Pending_GM', 'Pending_VP', 'Pending_Director'] },
+  };
   if (employeeCode) filter.employeeCode = { $regex: employeeCode, $options: 'i' };
 
   const total = await Attendance.countDocuments(filter);
@@ -484,6 +505,13 @@ export const approveCorrection = asyncHandler(async (req, res) => {
       attendance.totalMinutes = Math.round(workedMs / 60000);
       attendance.totalHours = parseFloat((workedMs / 3600000).toFixed(2));
     }
+
+    const { workingHours } = await getActiveOffice();
+    if (workingHours?.checkInTime && attendance.inTime) {
+      attendance.lateMinutes = calcLateMinutes(workingHours, new Date(attendance.inTime));
+      attendance.isLate = attendance.lateMinutes > 0;
+    }
+
     attendance.status = 'P';
     attendance.correctionStatus = 'Approved';
   } else {

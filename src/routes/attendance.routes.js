@@ -9,6 +9,7 @@ import {
   requestCorrection,
   approveCorrection,
   getPendingCorrections,
+  getMyCorrectionHistory,
   getEmployeeAttendanceSummary,
 } from '../controllers/attendance.controller.js';
 import { verifyJWT } from '../middleware/auth.middleware.js';
@@ -24,6 +25,7 @@ router.post('/check-out', checkOut);
 router.post('/track', trackLocation);
 router.get('/today', getTodayStatus);
 router.get('/my-summary', getMySummary);
+router.get('/my-corrections', getMyCorrectionHistory);
 
 // ── CORRECTION ──
 router.post('/correction', requestCorrection);

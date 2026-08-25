@@ -72,6 +72,7 @@ const attendanceSchema = new mongoose.Schema(
     correctionReason: { type: String },
     correctionProofUrl: { type: String }, // Cloudinary URL
     correctionRequestedOn: { type: Date },
+    correctionCount: { type: Number, default: 0 },
     
     // Requested Values
     requestedInTime: { type: Date },

@@ -18,6 +18,7 @@ import dashboardRoutes from './routes/dashboard.routes.js';
 import officeRoutes from './routes/office.routes.js';
 import leaveBalanceRoutes from './routes/leave-balance.routes.js';
 import taskRoutes from './routes/task.routes.js';
+import appVersionRoutes from './routes/appVersion.routes.js';
 
 import { ApiResponse } from './utils/ApiResponse.js';
 
@@ -114,6 +115,7 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/office-settings', officeRoutes);
 app.use('/api/leave-balance', leaveBalanceRoutes);
 app.use('/api/tasks', taskRoutes);
+app.use('/api/app-version', appVersionRoutes);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // NOT FOUND
