@@ -77,6 +77,11 @@ const attendanceSchema = new mongoose.Schema(
     // Requested Values
     requestedInTime: { type: Date },
     requestedOutTime: { type: Date },
+    requestedStatus: {
+      type: String,
+      enum: ['P', 'A', 'WO', 'L', 'Coff', 'AUTO', 'H', 'Half'],
+      default: 'P',
+    },
 
     // Audit
     correctionHistory: [{

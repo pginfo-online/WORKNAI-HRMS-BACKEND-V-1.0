@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { Attendance } from '../models/Attendance.model.js';
 import { Employee } from '../models/Employee.model.js';
 import { Holiday } from '../models/Holiday.model.js';
@@ -316,26 +317,27 @@ export const getMySummary = asyncHandler(async (req, res) => {
     const isWeekOff = workingHours?.workDays ? !workingHours.workDays.includes(dow) : dow === 0;
 
     let dayStatus = 'A';
-    if (holiday) {
+    if (record && (record.status === 'P' || record.inTime)) {
+      dayStatus = 'P';
+      summary.present++;
+      if (record.isLate) summary.late++;
+    } else if (record && record.status === 'Half') {
+      dayStatus = 'Half';
+      summary.halfDay++;
+    } else if (record && record.status === 'Coff') {
+      dayStatus = 'Coff';
+      summary.present++;
+    } else if (record && record.status === 'L') {
+      dayStatus = 'L';
+    } else if (holiday) {
       dayStatus = 'H';
       summary.holiday++;
     } else if (isWeekOff) {
       dayStatus = 'WO';
       summary.weekOff++;
-    } else if (record) {
-      if (record.status === 'P' || record.inTime) {
-        dayStatus = 'P';
-        summary.present++;
-        if (record.isLate) summary.late++;
-      } else if (record.status === 'Half') {
-        dayStatus = 'Half';
-        summary.halfDay++;
-      } else if (record.status === 'Coff') {
-        dayStatus = 'Coff';
-        summary.present++;
-      } else if (record.status === 'L') {
-        dayStatus = 'L';
-      }
+    } else if (record && record.status === 'A') {
+      dayStatus = 'A';
+      summary.absent++;
     } else if (dateStr < todayStr) {
       summary.absent++;
     } else {
@@ -373,11 +375,25 @@ export const getMySummary = asyncHandler(async (req, res) => {
 // ─── ATTENDANCE LIST (HR/ADMIN) ───────────────────────────────────────────────
 
 export const getAttendanceList = asyncHandler(async (req, res) => {
-  const { date, employeeCode, department, workMode, status, page = 1, limit = 20 } = req.query;
+  const { date, fromDate, toDate, employeeCode, search, department, workMode, status, page = 1, limit = 20 } = req.query;
 
   const filter = {};
-  if (date) filter.date = { $gte: startOfDay(new Date(date)), $lte: endOfDay(new Date(date)) };
-  if (employeeCode) filter.employeeCode = { $regex: employeeCode, $options: 'i' };
+  if (date) {
+    filter.date = { $gte: startOfDay(new Date(date)), $lte: endOfDay(new Date(date)) };
+  } else if (fromDate || toDate) {
+    filter.date = {};
+    if (fromDate) filter.date.$gte = startOfDay(new Date(fromDate));
+    if (toDate) filter.date.$lte = endOfDay(new Date(toDate));
+  }
+
+  const searchTerm = search || employeeCode;
+  if (searchTerm) {
+    filter.$or = [
+      { employeeCode: { $regex: searchTerm, $options: 'i' } },
+      { employeeName: { $regex: searchTerm, $options: 'i' } },
+    ];
+  }
+
   if (workMode) filter.workMode = workMode;
   if (status) filter.status = status;
 
@@ -388,51 +404,124 @@ export const getAttendanceList = asyncHandler(async (req, res) => {
 
   const total = await Attendance.countDocuments(filter);
   const records = await Attendance.find(filter)
-    .sort({ date: -1, employeeCode: 1 })
-    .skip((page - 1) * limit)
+    .sort({ date: -1, inTime: -1, createdAt: -1 })
+    .skip((Number(page) - 1) * Number(limit))
     .limit(Number(limit))
     .lean();
 
   res.json(new ApiResponse(200, {
+    records,
     data: records,
-    pagination: { total, page: Number(page), limit: Number(limit), totalPages: Math.ceil(total / limit) },
+    pagination: { total, page: Number(page), limit: Number(limit), totalPages: Math.ceil(total / Number(limit)) },
   }, 'Attendance list fetched'));
+});
+
+// ─── MARK REPORT AS READ ──────────────────────────────────────────────────────
+
+export const markReportAsRead = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user._id;
+
+  const record = await Attendance.findById(id);
+  if (!record) {
+    throw new ApiError(404, 'Attendance record not found');
+  }
+
+  if (!record.reportReadBy) {
+    record.reportReadBy = [];
+  }
+
+  const alreadyRead = record.reportReadBy.some(
+    (readId) => readId.toString() === userId.toString()
+  );
+
+  if (!alreadyRead) {
+    record.reportReadBy.push(userId);
+    await record.save();
+  }
+
+  res.json(new ApiResponse(200, record, 'Report marked as read'));
 });
 
 // ─── CORRECTION REQUEST ───────────────────────────────────────────────────────
 
-// ─── CORRECTION REQUEST ───────────────────────────────────────────────────────
-
 export const requestCorrection = asyncHandler(async (req, res) => {
-  const { attendanceId, requestedInTime, requestedOutTime, correctionReason, correctionProofUrl } = req.body;
+  const attendanceId = req.body.attendanceId || req.params.id;
+  const {
+    date,
+    requestedInTime,
+    requestedOutTime,
+    requestedStatus = 'P',
+    correctionReason,
+    reason,
+    correctionProofUrl,
+    proofUrl,
+  } = req.body;
 
-  if (!requestedInTime && !requestedOutTime) {
-    throw new ApiError(400, 'Please provide at least a requested check-in or check-out time');
+  const actualReason = correctionReason || reason || '';
+  const actualProofUrl = correctionProofUrl || proofUrl || '';
+
+  if (!requestedInTime && !requestedOutTime && !actualReason) {
+    throw new ApiError(400, 'Please provide at least a requested check-in/check-out time or reason');
   }
 
-  const attendance = await Attendance.findById(attendanceId);
-  if (!attendance) throw new ApiError(404, 'Attendance record not found');
+  let attendance = null;
+
+  // 1. Try finding by valid MongoDB ObjectId
+  if (attendanceId && mongoose.Types.ObjectId.isValid(attendanceId)) {
+    attendance = await Attendance.findById(attendanceId);
+  }
+
+  // 2. If not found by ID, try finding by employee and date
+  const targetDateStr = date || requestedInTime || (attendance ? attendance.date : null);
+  if (!attendance && targetDateStr) {
+    const targetDate = startOfDay(new Date(targetDateStr));
+    attendance = await Attendance.findOne({
+      employeeCode: req.user.employeeCode,
+      date: targetDate,
+    });
+  }
+
+  // 3. If still no record exists (e.g. Absent day or Holiday with no record document), create one!
+  if (!attendance) {
+    if (!targetDateStr) {
+      throw new ApiError(400, 'Attendance date or valid record ID is required');
+    }
+    const targetDate = startOfDay(new Date(targetDateStr));
+    attendance = new Attendance({
+      employeeId: req.user._id,
+      employeeCode: req.user.employeeCode,
+      employeeName: req.user.name,
+      date: targetDate,
+      status: 'A',
+      correctionStatus: 'None',
+    });
+  }
+
   if (attendance.employeeId.toString() !== req.user._id.toString()) {
     throw new ApiError(403, 'You can only request correction for your own attendance');
   }
-  if (attendance.correctionStatus === 'Pending_HR' || attendance.correctionStatus === 'Pending_GM') {
+
+  if (['Pending_HR', 'Pending_GM', 'Pending_VP', 'Pending_Director'].includes(attendance.correctionStatus)) {
     throw new ApiError(400, 'A correction request is already pending for this date');
   }
 
   attendance.correctionRequested = true;
   attendance.correctionStatus = 'Pending_HR';
-  attendance.correctionReason = correctionReason;
+  attendance.correctionReason = actualReason;
   attendance.correctionCount = (attendance.correctionCount || 0) + 1;
-  if (correctionProofUrl) attendance.correctionProofUrl = correctionProofUrl;
+  if (actualProofUrl) attendance.correctionProofUrl = actualProofUrl;
   attendance.correctionRequestedOn = new Date();
   if (requestedInTime) attendance.requestedInTime = new Date(requestedInTime);
   if (requestedOutTime) attendance.requestedOutTime = new Date(requestedOutTime);
+  if (requestedStatus) attendance.requestedStatus = requestedStatus;
 
   attendance.correctionHistory.push({
     action: 'Requested',
     byRole: req.user.role,
     byEmployeeId: req.user._id,
-    remark: correctionReason,
+    remark: actualReason || `Correction requested (${requestedStatus})`,
+    timestamp: new Date(),
   });
 
   await attendance.save();
@@ -440,17 +529,34 @@ export const requestCorrection = asyncHandler(async (req, res) => {
   res.status(200).json(new ApiResponse(200, attendance, 'Correction request submitted to HR'));
 });
 
-// ─── GET MY CORRECTION HISTORY ───────────────────────────────────────────────
+// ─── GET CORRECTION HISTORY ───────────────────────────────────────────────────
 
 export const getMyCorrectionHistory = asyncHandler(async (req, res) => {
-  const records = await Attendance.find({
-    employeeCode: req.user.employeeCode,
-    correctionRequested: true,
-  })
-    .sort({ correctionRequestedOn: -1 })
+  const { month, year, employeeCode } = req.query;
+  const isManager = ['Admin', 'SuperAdmin', 'HR', 'Director', 'VP', 'GM', 'Manager'].includes(req.user.role);
+
+  const filter = { correctionRequested: true };
+
+  // If not a manager role, force own employeeCode
+  if (!isManager || !employeeCode) {
+    if (!isManager) {
+      filter.employeeCode = req.user.employeeCode;
+    }
+  } else if (employeeCode) {
+    filter.employeeCode = employeeCode;
+  }
+
+  if (month && year) {
+    const start = new Date(Number(year), Number(month) - 1, 1, 0, 0, 0, 0);
+    const end = new Date(Number(year), Number(month), 0, 23, 59, 59, 999);
+    filter.date = { $gte: start, $lte: end };
+  }
+
+  const records = await Attendance.find(filter)
+    .sort({ correctionRequestedOn: -1, date: -1 })
     .lean();
 
-  res.status(200).json(new ApiResponse(200, records, 'My correction requests history fetched'));
+  res.status(200).json(new ApiResponse(200, records, 'Correction requests history fetched'));
 });
 
 // ─── GET PENDING CORRECTIONS (HR / ADMIN) ─────────────────────────────────────
@@ -487,7 +593,7 @@ export const getPendingCorrections = asyncHandler(async (req, res) => {
 
 export const approveCorrection = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { status, remark } = req.body; // status: 'Approved' | 'Rejected'
+  const { status, remark, requestedStatus } = req.body; // status: 'Approved' | 'Rejected'
 
   if (!['Approved', 'Rejected'].includes(status)) {
     throw new ApiError(400, "Invalid status. Must be 'Approved' or 'Rejected'");
@@ -502,7 +608,7 @@ export const approveCorrection = asyncHandler(async (req, res) => {
 
     if (attendance.inTime && attendance.outTime) {
       const workedMs = new Date(attendance.outTime) - new Date(attendance.inTime);
-      attendance.totalMinutes = Math.round(workedMs / 60000);
+      attendance.totalMinutes = Math.max(0, Math.round(workedMs / 60000));
       attendance.totalHours = parseFloat((workedMs / 3600000).toFixed(2));
     }
 
@@ -512,7 +618,8 @@ export const approveCorrection = asyncHandler(async (req, res) => {
       attendance.isLate = attendance.lateMinutes > 0;
     }
 
-    attendance.status = 'P';
+    // Set approved status
+    attendance.status = requestedStatus || attendance.requestedStatus || 'P';
     attendance.correctionStatus = 'Approved';
   } else {
     attendance.correctionStatus = 'Rejected';
@@ -523,6 +630,7 @@ export const approveCorrection = asyncHandler(async (req, res) => {
     byRole: req.user.role,
     byEmployeeId: req.user._id,
     remark: remark || `Correction ${status.toLowerCase()}`,
+    timestamp: new Date(),
   });
 
   await attendance.save();

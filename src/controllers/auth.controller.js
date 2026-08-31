@@ -8,7 +8,12 @@ import {
   generateRefreshToken,
   verifyRefreshToken,
 } from '../services/jwt.service.js';
-import { uploadToCloudinary, getPublicIdFromUrl, deleteFromCloudinary } from '../services/cloudinary.service.js';
+import {
+  uploadToCloudinary,
+  uploadBase64ToCloudinary,
+  getPublicIdFromUrl,
+  deleteFromCloudinary,
+} from '../services/cloudinary.service.js';
 import { upload } from '../middleware/upload.middleware.js';
 
 const COOKIE_OPTIONS = {
@@ -124,6 +129,53 @@ export const getMe = asyncHandler(async (req, res) => {
   }, 'Profile fetched'));
 });
 
+// ─── UPLOAD AVATAR (DEDICATED MEDIA ENDPOINT) ──────────────────────────────────
+
+export const uploadAvatar = asyncHandler(async (req, res) => {
+  const employee = await Employee.findById(req.user._id);
+  if (!employee) throw new ApiError(404, 'Employee not found');
+
+  const base64Image =
+    req.body.profileImageBase64 ||
+    (typeof req.body.profileImage === 'string' && req.body.profileImage.startsWith('data:')
+      ? req.body.profileImage
+      : null);
+
+  if (!req.file && !base64Image) {
+    throw new ApiError(400, 'Profile image file is required');
+  }
+
+  // Remove existing Cloudinary photo if exists
+  if (employee.profileImageUrl) {
+    const oldPublicId = getPublicIdFromUrl(employee.profileImageUrl);
+    if (oldPublicId) await deleteFromCloudinary(oldPublicId).catch(() => {});
+  }
+
+  let result;
+  if (req.file) {
+    result = await uploadToCloudinary(req.file.buffer, {
+      folder: `hrms/employees/${employee.employeeCode}`,
+      public_id: `profile_${Date.now()}`,
+    });
+  } else if (base64Image) {
+    result = await uploadBase64ToCloudinary(base64Image, {
+      folder: `hrms/employees/${employee.employeeCode}`,
+      public_id: `profile_${Date.now()}`,
+    });
+  }
+
+  employee.profileImageUrl = result.secure_url;
+  await employee.save();
+
+  res.json(
+    new ApiResponse(
+      200,
+      { profileImageUrl: result.secure_url, employee: employee.toSafeObject() },
+      'Profile avatar updated successfully'
+    )
+  );
+});
+
 // ─── UPDATE PROFILE (SELF) ────────────────────────────────────────────────────
 
 export const updateProfile = asyncHandler(async (req, res) => {
@@ -131,11 +183,36 @@ export const updateProfile = asyncHandler(async (req, res) => {
   if (!employee) throw new ApiError(404, 'Employee not found');
 
   const allowedSelfEdit = [
-    'mobileNumber', 'alternateMobileNumber', 'currentAddress', 'permanentAddress',
-    'bloodGroup', 'emergencyContactName', 'emergencyContactMobile', 'emergencyContactRelationship',
-    'emergencyContactAddress', 'maritalStatus',
+    'mobileNumber',
+    'alternateMobileNumber',
+    'gender',
+    'bloodGroup',
+    'maritalStatus',
+    'fatherName',
+    'motherName',
+    'currentAddress',
+    'permanentAddress',
+    'district',
+    'state',
+    'pincode',
+    'emergencyContactName',
+    'emergencyContactRelationship',
+    'emergencyContactMobile',
+    'emergencyContactAddress',
+    'profileImageUrl',
   ];
-  allowedSelfEdit.forEach((f) => { if (req.body[f]) employee[f] = req.body[f]; });
+
+  allowedSelfEdit.forEach((f) => {
+    if (req.body[f] !== undefined) {
+      employee[f] = req.body[f];
+    }
+  });
+
+  const base64Image =
+    req.body.profileImageBase64 ||
+    (typeof req.body.profileImage === 'string' && req.body.profileImage.startsWith('data:')
+      ? req.body.profileImage
+      : null);
 
   if (req.file) {
     if (employee.profileImageUrl) {
@@ -144,13 +221,24 @@ export const updateProfile = asyncHandler(async (req, res) => {
     }
     const result = await uploadToCloudinary(req.file.buffer, {
       folder: `hrms/employees/${employee.employeeCode}`,
-      public_id: 'profile',
+      public_id: `profile_${Date.now()}`,
+    });
+    employee.profileImageUrl = result.secure_url;
+  } else if (base64Image) {
+    if (employee.profileImageUrl) {
+      const oldPublicId = getPublicIdFromUrl(employee.profileImageUrl);
+      if (oldPublicId) await deleteFromCloudinary(oldPublicId).catch(() => {});
+    }
+    const result = await uploadBase64ToCloudinary(base64Image, {
+      folder: `hrms/employees/${employee.employeeCode}`,
+      public_id: `profile_${Date.now()}`,
     });
     employee.profileImageUrl = result.secure_url;
   }
 
   await employee.save();
-  res.json(new ApiResponse(200, employee.toSafeObject(), 'Profile updated'));
+
+  res.json(new ApiResponse(200, employee.toSafeObject(), 'Profile updated successfully'));
 });
 
 // ─── CHANGE PASSWORD ──────────────────────────────────────────────────────────

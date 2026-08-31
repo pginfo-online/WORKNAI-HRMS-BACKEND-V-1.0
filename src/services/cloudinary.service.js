@@ -23,6 +23,24 @@ export const uploadToCloudinary = (buffer, options = {}) => {
     uploadStream.end(buffer);
   });
 };
+/**
+ * Upload a base64 data URI or string to Cloudinary
+ * @param {string} base64String - Base64 data URI (e.g. data:image/jpeg;base64,...)
+ * @param {Object} options - Cloudinary upload options
+ * @returns {Promise<Object>} - Cloudinary upload result
+ */
+export const uploadBase64ToCloudinary = async (base64String, options = {}) => {
+  try {
+    const result = await cloudinary.uploader.upload(base64String, {
+      folder: options.folder || 'hrms',
+      resource_type: options.resourceType || 'auto',
+      ...options,
+    });
+    return result;
+  } catch (error) {
+    throw new ApiError(500, `Cloudinary upload failed: ${error.message}`);
+  }
+};
 
 /**
  * Delete a file from Cloudinary by public_id
@@ -33,11 +51,22 @@ export const deleteFromCloudinary = async (publicId) => {
 };
 
 /**
- * Extract public_id from a Cloudinary URL
+ * Extract public_id from a Cloudinary URL including folder structures
  */
 export const getPublicIdFromUrl = (url) => {
-  if (!url) return null;
-  const parts = url.split('/');
-  const fileName = parts[parts.length - 1];
-  return `hrms/${fileName.split('.')[0]}`;
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const uploadIndex = url.indexOf('/upload/');
+    if (uploadIndex === -1) return null;
+    let path = url.substring(uploadIndex + 8);
+    path = path.replace(/^v\d+\//, '');
+    const dotIndex = path.lastIndexOf('.');
+    if (dotIndex !== -1) {
+      path = path.substring(0, dotIndex);
+    }
+    return path;
+  } catch {
+    return null;
+  }
 };
+
