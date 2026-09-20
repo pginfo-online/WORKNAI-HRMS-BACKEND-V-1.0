@@ -26,6 +26,7 @@ const employeeSchema = new mongoose.Schema(
     // ── AUTH ──
     password: { type: String, required: true, minlength: 6, select: false },
     refreshToken: { type: String, select: false },
+    refreshTokens: { type: [String], select: false, default: [] },
 
     // ── ACCOUNT ──
     role: {
@@ -139,6 +140,7 @@ employeeSchema.methods.toSafeObject = function () {
   const obj = this.toObject();
   delete obj.password;
   delete obj.refreshToken;
+  delete obj.refreshTokens;
   return obj;
 };
 

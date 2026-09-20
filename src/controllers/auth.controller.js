@@ -22,7 +22,7 @@ const COOKIE_OPTIONS = {
   sameSite: 'strict',
 };
 
-const generateTokensForEmployee = async (employee) => {
+const generateTokensForEmployee = async (employee, oldTokenToReplace = null) => {
   const payload = {
     _id: employee._id,
     employeeCode: employee.employeeCode,
@@ -31,7 +31,15 @@ const generateTokensForEmployee = async (employee) => {
   };
   const accessToken = generateAccessToken(payload);
   const refreshToken = generateRefreshToken({ _id: employee._id });
+
   employee.refreshToken = refreshToken;
+  const currentTokens = Array.isArray(employee.refreshTokens) ? employee.refreshTokens : [];
+  const updatedTokens = oldTokenToReplace
+    ? currentTokens.filter((t) => t !== oldTokenToReplace)
+    : currentTokens;
+  updatedTokens.push(refreshToken);
+  employee.refreshTokens = updatedTokens.slice(-10); // Retain last 10 sessions across web and mobile
+
   await employee.save({ validateBeforeSave: false });
   return { accessToken, refreshToken };
 };
@@ -43,7 +51,7 @@ export const login = asyncHandler(async (req, res) => {
   if (!employeeCode || !password) throw new ApiError(400, 'Employee code and password are required');
 
   const code = employeeCode.toUpperCase().trim();
-  const user = await Employee.findOne({ employeeCode: code }).select('+password +refreshToken');
+  const user = await Employee.findOne({ employeeCode: code }).select('+password +refreshToken +refreshTokens');
   if (!user) throw new ApiError(401, 'Invalid employee code or password');
   if (user.status !== 'Active') throw new ApiError(403, 'Account is deactivated. Contact HR.');
 
@@ -73,7 +81,7 @@ export const login = asyncHandler(async (req, res) => {
 
   res
     .status(200)
-    .cookie('accessToken', accessToken, { ...COOKIE_OPTIONS, maxAge: 15 * 60 * 1000 })
+    .cookie('accessToken', accessToken, { ...COOKIE_OPTIONS, maxAge: 2 * 60 * 60 * 1000 })
     .cookie('refreshToken', refreshToken, { ...COOKIE_OPTIONS, maxAge: 7 * 24 * 60 * 60 * 1000 })
     .json(new ApiResponse(200, { employee: safeUser, accessToken, refreshToken }, 'Login successful'));
 });
@@ -81,7 +89,17 @@ export const login = asyncHandler(async (req, res) => {
 // ─── LOGOUT ───────────────────────────────────────────────────────────────────
 
 export const logout = asyncHandler(async (req, res) => {
-  await Employee.findByIdAndUpdate(req.user._id, { $unset: { refreshToken: 1 } });
+  const token = req.cookies?.refreshToken || req.body.refreshToken;
+  if (token) {
+    await Employee.findByIdAndUpdate(req.user._id, {
+      $pull: { refreshTokens: token },
+    });
+  } else {
+    await Employee.findByIdAndUpdate(req.user._id, {
+      $unset: { refreshToken: 1 },
+      $set: { refreshTokens: [] },
+    });
+  }
   res
     .clearCookie('accessToken', COOKIE_OPTIONS)
     .clearCookie('refreshToken', COOKIE_OPTIONS)
@@ -101,14 +119,19 @@ export const refreshToken = asyncHandler(async (req, res) => {
     throw new ApiError(401, 'Invalid or expired refresh token');
   }
 
-  const user = await Employee.findById(decoded._id).select('+refreshToken');
-  if (!user || user.refreshToken !== token) throw new ApiError(401, 'Invalid refresh token');
+  const user = await Employee.findById(decoded._id).select('+refreshToken +refreshTokens');
+  if (!user) throw new ApiError(401, 'User not found');
+  if (user.status !== 'Active') throw new ApiError(403, 'Account is deactivated');
 
-  const { accessToken: newAccessToken, refreshToken: newRefreshToken } = await generateTokensForEmployee(user);
+  const tokenList = Array.isArray(user.refreshTokens) ? user.refreshTokens : [];
+  const isValid = user.refreshToken === token || tokenList.includes(token);
+  if (!isValid) throw new ApiError(401, 'Invalid refresh token');
+
+  const { accessToken: newAccessToken, refreshToken: newRefreshToken } = await generateTokensForEmployee(user, token);
 
   res
     .status(200)
-    .cookie('accessToken', newAccessToken, { ...COOKIE_OPTIONS, maxAge: 15 * 60 * 1000 })
+    .cookie('accessToken', newAccessToken, { ...COOKIE_OPTIONS, maxAge: 2 * 60 * 60 * 1000 })
     .cookie('refreshToken', newRefreshToken, { ...COOKIE_OPTIONS, maxAge: 7 * 24 * 60 * 60 * 1000 })
     .json(new ApiResponse(200, { accessToken: newAccessToken, refreshToken: newRefreshToken }, 'Token refreshed'));
 });
