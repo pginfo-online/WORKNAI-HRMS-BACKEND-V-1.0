@@ -60,7 +60,7 @@ export const renderSalarySlipDoc = (payroll, doc) => {
     if (!d) return 'N/A';
     return new Intl.DateTimeFormat('en-GB', {
       day: 'numeric',
-      month: 'long',
+      month: 'short',
       year: 'numeric',
       timeZone: 'UTC',
     }).format(new Date(d));
@@ -71,37 +71,52 @@ export const renderSalarySlipDoc = (payroll, doc) => {
   const targetMonthName = months[(payroll.month || 1) - 1] || '';
   const targetYear = payroll.year || new Date().getFullYear();
 
-  const titleText = `${fromStr} - ${toStr} : PAYSLIP FOR THE MONTH OF ${targetMonthName.toUpperCase()} ${targetYear}`;
-
-  // --- BRANDING & LOGO (Top-Center with strict bounding box) ---
+  // --- BRANDING & CORPORATE HEADER ---
   const logoPathBack = path.join(__dirname, '../assets/logo.png');
   const logoPathFront = path.join(__dirname, '../../../frontend/src/assets/logo.png');
   let logoToUse = null;
   if (fs.existsSync(logoPathBack)) logoToUse = logoPathBack;
   else if (fs.existsSync(logoPathFront)) logoToUse = logoPathFront;
 
+  // Header layout: Logo on left, Company details on right
   if (logoToUse) {
     try {
-      // Use fit to preserve aspect ratio within a 160x55 box without vertical spillover
-      // A4 page width = 595.28. Centered X = (595.28 - 160) / 2 = 217.64
-      doc.image(logoToUse, 217.6, 20, { fit: [160, 55], align: 'center', valign: 'center' });
+      doc.image(logoToUse, 40, 24, { fit: [130, 48], align: 'left', valign: 'center' });
     } catch (err) {
       console.warn('Could not render logo in PDF:', err.message);
     }
   }
 
-  // --- SALARY SLIP TITLE BAR (Fixed Y at 85 to prevent any logo overlap) ---
-  const titleY = 85;
-  doc.rect(40, titleY, 515, 24).fill('#f1f5f9');
-  doc.fillColor('#0f172a').fontSize(9.5).font('Helvetica-Bold')
-     .text(titleText.toUpperCase(), 40, titleY + 7, { align: 'center', width: 515 });
+  // Company Corporate Details (Right Aligned Header)
+  doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a')
+     .text('Worknai Technologies Pvt. Ltd.', 200, 24, { align: 'right', width: 355 });
+  doc.fontSize(7.5).font('Helvetica').fillColor('#475569')
+     .text('Corporate Office: Baner IT Park, Pune, Maharashtra - 411045', 200, 39, { align: 'right', width: 355 })
+     .text('CIN: U72900MH2024PTC123456 | GSTIN: 27AABCU9603R1ZM', 200, 49, { align: 'right', width: 355 })
+     .text('Contact: payroll@worknai.com | https://worknai.com', 200, 59, { align: 'right', width: 355 });
 
-  // --- EMPLOYEE SUMMARY SECTION ---
-  const startY = 120;
-  const col1 = 45;
+  // Divider below company header
+  doc.moveTo(40, 75).lineTo(555, 75).lineWidth(1).stroke('#cbd5e1');
+
+  // --- SALARY SLIP TITLE BANNER ---
+  const titleY = 82;
+  doc.rect(40, titleY, 515, 26).fill('#f8fafc');
+  doc.rect(40, titleY, 515, 26).lineWidth(0.5).stroke('#e2e8f0');
+  
+  const titleLeft = `PAYSLIP FOR ${targetMonthName.toUpperCase()} ${targetYear}`;
+  const titleRight = `Pay Period: ${fromStr} to ${toStr}`;
+  
+  doc.fillColor('#0f172a').fontSize(9.5).font('Helvetica-Bold')
+     .text(titleLeft, 50, titleY + 8);
+  doc.fillColor('#64748b').fontSize(8.5).font('Helvetica')
+     .text(titleRight, 250, titleY + 9, { align: 'right', width: 295 });
+
+  // --- EMPLOYEE & STATUTORY PROFILE MATRIX ---
+  const startY = 118;
+  const col1 = 48;
   const col2 = 145;
   const col3 = 310;
-  const col4 = 410;
+  const col4 = 405;
 
   const formatDateShort = (dateString) =>
     dateString
@@ -121,64 +136,82 @@ export const renderSalarySlipDoc = (payroll, doc) => {
   const joiningDate = formatDateShort(emp.joiningDate);
   const panNumber = emp.panNumber || 'N/A';
   const bankName = emp.bankName || 'N/A';
-  const accountNumber = emp.accountNumber || 'N/A';
+  const rawAccount = emp.accountNumber || '';
+  const maskedAccount = rawAccount && rawAccount !== 'N/A' && rawAccount.length > 4
+    ? `XXXX-XXXX-${rawAccount.slice(-4)}`
+    : (rawAccount || 'N/A');
+  const ifsc = emp.ifsc || 'N/A';
+
+  // Profile Card Box
+  doc.rect(40, startY - 6, 515, 82).fill('#ffffff');
+  doc.rect(40, startY - 6, 515, 82).lineWidth(0.75).stroke('#e2e8f0');
 
   // Row 1
-  doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#475569').text('Employee Name:', col1, startY);
+  doc.fontSize(8).font('Helvetica-Bold').fillColor('#64748b').text('Employee Name:', col1, startY);
   doc.font('Helvetica-Bold').fillColor('#0f172a').text(empName, col2, startY);
 
-  doc.font('Helvetica-Bold').fillColor('#475569').text('Employee ID:', col3, startY);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Employee Code:', col3, startY);
   doc.font('Helvetica-Bold').fillColor('#0f172a').text(empCode, col4, startY);
 
   // Row 2
-  doc.font('Helvetica-Bold').fillColor('#475569').text('Designation:', col1, startY + 16);
-  doc.font('Helvetica').fillColor('#1e293b').text(position, col2, startY + 16);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Designation:', col1, startY + 15);
+  doc.font('Helvetica').fillColor('#1e293b').text(position, col2, startY + 15);
 
-  doc.font('Helvetica-Bold').fillColor('#475569').text('Department:', col3, startY + 16);
-  doc.font('Helvetica').fillColor('#1e293b').text(department, col4, startY + 16);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Department:', col3, startY + 15);
+  doc.font('Helvetica').fillColor('#1e293b').text(department, col4, startY + 15);
 
   // Row 3
-  doc.font('Helvetica-Bold').fillColor('#475569').text('Joining Date:', col1, startY + 32);
-  doc.font('Helvetica').fillColor('#1e293b').text(joiningDate, col2, startY + 32);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Date of Joining:', col1, startY + 30);
+  doc.font('Helvetica').fillColor('#1e293b').text(joiningDate, col2, startY + 30);
 
-  doc.font('Helvetica-Bold').fillColor('#475569').text('PAN No:', col3, startY + 32);
-  doc.font('Helvetica').fillColor('#1e293b').text(panNumber, col4, startY + 32);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('PAN Number:', col3, startY + 30);
+  doc.font('Helvetica').fillColor('#1e293b').text(panNumber, col4, startY + 30);
 
   // Row 4
-  doc.font('Helvetica-Bold').fillColor('#475569').text('Bank Name:', col1, startY + 48);
-  doc.font('Helvetica').fillColor('#1e293b').text(bankName, col2, startY + 48);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Bank Name:', col1, startY + 45);
+  doc.font('Helvetica').fillColor('#1e293b').text(bankName, col2, startY + 45);
 
-  doc.font('Helvetica-Bold').fillColor('#475569').text('Account No:', col3, startY + 48);
-  doc.font('Helvetica').fillColor('#1e293b').text(accountNumber, col4, startY + 48);
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Bank Account No:', col3, startY + 45);
+  doc.font('Helvetica').fillColor('#1e293b').text(maskedAccount, col4, startY + 45);
+
+  // Row 5
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Bank IFSC Code:', col1, startY + 60);
+  doc.font('Helvetica').fillColor('#1e293b').text(ifsc, col2, startY + 60);
+
+  doc.font('Helvetica-Bold').fillColor('#64748b').text('Payment Mode:', col3, startY + 60);
+  doc.font('Helvetica').fillColor('#1e293b').text('Direct Bank Transfer', col4, startY + 60);
 
   // --- ATTENDANCE SUMMARY BOX ---
-  const attY = startY + 70;
-  doc.rect(40, attY, 515, 42).lineWidth(0.75).stroke('#cbd5e1');
+  const attY = startY + 86;
+  doc.rect(40, attY, 515, 44).fill('#f1f5f9');
+  doc.rect(40, attY, 515, 44).lineWidth(0.75).stroke('#cbd5e1');
 
-  doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#64748b');
-  doc.text('Total Days', 48, attY + 7);
-  doc.text('Paid Days', 115, attY + 7);
-  doc.text('Present Days', 185, attY + 7);
-  doc.text('Half Days', 260, attY + 7);
-  doc.text('Paid Leaves', 330, attY + 7);
-  doc.text('Hols / WOs', 405, attY + 7);
-  doc.text('Absent / LWP', 475, attY + 7);
+  doc.fontSize(7).font('Helvetica-Bold').fillColor('#64748b');
+  doc.text('TOTAL DAYS', 48, attY + 8);
+  doc.text('PAID DAYS', 115, attY + 8);
+  doc.text('PRESENT', 185, attY + 8);
+  doc.text('HALF DAYS', 255, attY + 8);
+  doc.text('PAID LEAVES', 325, attY + 8);
+  doc.text('HOLS / WOs', 400, attY + 8);
+  doc.text('ABSENT / LWP', 472, attY + 8);
 
   doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#0f172a');
-  doc.text(`${payroll.totalDaysInMonth || 0}`, 48, attY + 22);
-  doc.text(`${payroll.paidDays || 0}`, 115, attY + 22);
-  doc.text(`${payroll.presentDays || 0}`, 185, attY + 22);
-  doc.text(`${payroll.halfDays || 0}`, 260, attY + 22);
-  doc.text(`${payroll.paidLeavesTaken || 0}`, 330, attY + 22);
-  doc.text(`${(payroll.holidays || 0) + (payroll.weekOffs || 0)}`, 405, attY + 22);
-  doc.text(`${payroll.absentDays || payroll.unpaidLeavesTaken || 0}`, 475, attY + 22);
+  doc.text(`${payroll.totalDaysInMonth || 0}`, 48, attY + 23);
+  doc.fillColor('#059669').text(`${payroll.paidDays || 0}`, 115, attY + 23);
+  doc.fillColor('#0f172a').text(`${payroll.presentDays || 0}`, 185, attY + 23);
+  doc.text(`${payroll.halfDays || 0}`, 255, attY + 23);
+  doc.text(`${payroll.paidLeavesTaken || 0}`, 325, attY + 23);
+  doc.text(`${Math.max(0, (payroll.holidays || 0) + (payroll.weekOffs || 0) - (payroll.sandwichDeductions || 0))}`, 400, attY + 23);
+  doc.fillColor(payroll.absentDays > 0 ? '#dc2626' : '#0f172a').text(`${payroll.absentDays || payroll.unpaidLeavesTaken || 0}`, 472, attY + 23);
 
   // --- EARNINGS & DEDUCTIONS TABLE ---
   const tableY = attY + 54;
-  const tableHeight = 120;
+  const tableHeight = 126;
 
   // Table Headers
-  doc.rect(40, tableY, 515, 20).fillAndStroke('#e2e8f0', '#cbd5e1');
+  doc.rect(40, tableY, 258, 20).fillAndStroke('#e2e8f0', '#cbd5e1');
+  doc.rect(298, tableY, 257, 20).fillAndStroke('#e2e8f0', '#cbd5e1');
+
   doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(8.5);
   doc.text('EARNINGS', 50, tableY + 6);
   doc.text('AMOUNT (INR)', 210, tableY + 6, { width: 80, align: 'right' });
@@ -198,68 +231,78 @@ export const renderSalarySlipDoc = (payroll, doc) => {
   const currentGross = parseFloat(payroll.grossEarnings || 0);
   const baseSalary = parseFloat(payroll.baseSalary || 0);
 
-  doc.text('Basic Salary (Fixed)', 50, rowY);
+  doc.text('Basic Salary (Fixed CTC)', 50, rowY);
   doc.text(`${baseSalary.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 210, rowY, { width: 80, align: 'right' });
 
-  doc.text('Gross Earned (Paid Days)', 50, rowY + 16);
-  doc.text(`${currentGross.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 210, rowY + 16, { width: 80, align: 'right' });
+  doc.text(`Gross Earned (${payroll.paidDays || 0} Paid Days)`, 50, rowY + 18);
+  doc.font('Helvetica-Bold').text(`${currentGross.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 210, rowY + 18, { width: 80, align: 'right' });
 
   // Deductions Rows
+  doc.font('Helvetica');
   const pt = parseFloat(payroll.professionalTax || 0);
   const otherDed = parseFloat(payroll.otherDeductions || 0);
 
   doc.text('Professional Tax (PT)', 310, rowY);
   doc.text(`${pt.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 465, rowY, { width: 80, align: 'right' });
 
+  let curDedY = rowY + 18;
   if (otherDed > 0) {
-    doc.text(payroll.otherDeductionRemarks || 'Other Deductions', 310, rowY + 16);
-    doc.text(`${otherDed.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 465, rowY + 16, { width: 80, align: 'right' });
+    doc.text(payroll.otherDeductionRemarks || 'Other Deductions', 310, curDedY);
+    doc.text(`${otherDed.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 465, curDedY, { width: 80, align: 'right' });
+    curDedY += 18;
+  }
+
+  if (payroll.sandwichDeductions > 0) {
+    doc.text(`Sandwich Deductions (${payroll.sandwichDeductions} day(s))`, 310, curDedY);
+    doc.text('Included in Gross', 430, curDedY, { width: 115, align: 'right' });
   }
 
   // Draw Total separator
   doc.moveTo(40, tableY + tableHeight - 24).lineTo(555, tableY + tableHeight - 24).stroke('#cbd5e1');
 
-  // Totals Line (Using 'Rs.' to avoid win-ansi Rupee symbol character corruption)
+  // Totals Line (Using 'Rs.' for win-ansi font compatibility)
   doc.font('Helvetica-Bold');
-  const totEY = tableY + tableHeight - 18;
+  const totEY = tableY + tableHeight - 17;
   doc.text('Total Gross Earnings', 50, totEY);
-  doc.text(`Rs. ${currentGross.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 200, totEY, { width: 90, align: 'right' });
+  doc.fillColor('#059669').text(`Rs. ${currentGross.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 200, totEY, { width: 90, align: 'right' });
 
   const totDed = pt + otherDed;
-  doc.text('Total Deductions', 310, totEY);
-  doc.text(`Rs. ${totDed.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 455, totEY, { width: 90, align: 'right' });
+  doc.fillColor('#0f172a').text('Total Deductions', 310, totEY);
+  doc.fillColor(totDed > 0 ? '#dc2626' : '#0f172a').text(`Rs. ${totDed.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, 455, totEY, { width: 90, align: 'right' });
 
-  // --- NET SALARY HIGHLIGHT BOX ---
+  // --- NET SALARY HIGHLIGHT BANNER ---
   const netY = tableY + tableHeight + 14;
-  doc.rect(40, netY, 515, 32).fillAndStroke('#ecfdf5', '#a7f3d0');
-  doc.fillColor('#065f46').fontSize(10).font('Helvetica-Bold');
-  doc.text('Net Amount Payable:', 50, netY + 10);
-  doc.fontSize(12).text(
+  doc.rect(40, netY, 515, 36).fillAndStroke('#ecfdf5', '#10b981');
+  doc.fillColor('#065f46').fontSize(9.5).font('Helvetica-Bold');
+  doc.text('NET TAKE-HOME SALARY:', 52, netY + 12);
+  doc.fontSize(13).text(
     `Rs. ${parseFloat(payroll.netSalary || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
-    350,
-    netY + 9,
-    { width: 195, align: 'right' }
+    340,
+    netY + 11,
+    { width: 205, align: 'right' }
   );
 
   // --- NET SALARY IN WORDS ---
-  const wordsY = netY + 42;
-  doc.fillColor('#1e293b').font('Helvetica-Bold').fontSize(8.5);
+  const wordsY = netY + 44;
+  doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(8.5);
   doc.text('Amount in Words: ', 40, wordsY, { continued: true });
-  doc.font('Helvetica').text(`Rupees ${convertNumberToWords(Math.round(payroll.netSalary || 0))} Only`);
+  doc.font('Helvetica').fillColor('#334155').text(`Rupees ${convertNumberToWords(Math.round(payroll.netSalary || 0))} Only`);
 
-  // --- NOTES / SANDWICH DEDUCTIONS ---
+  // --- NOTES / COMPLIANCE ---
   let noteY = wordsY + 16;
   if (payroll.sandwichDeductions > 0) {
     doc.fillColor('#dc2626').font('Helvetica-Bold').fontSize(8);
-    doc.text(`Note: ${payroll.sandwichDeductions} day(s) of Sandwich Leave Deduction applied in this period.`, 40, noteY);
+    doc.text(`* Statutory Notice: ${payroll.sandwichDeductions} day(s) of Sandwich Leave Deduction applied in this cycle.`, 40, noteY);
     noteY += 14;
   }
 
   // --- FOOTER & DISCLAIMER ---
-  const footY = Math.max(noteY + 20, 750);
-  doc.moveTo(40, footY).lineTo(555, footY).lineWidth(0.5).stroke('#e2e8f0');
-  doc.font('Helvetica').fontSize(7.5).fillColor('#94a3b8');
-  doc.text('This is a computer-generated salary slip and does not require a physical signature.', 40, footY + 8, { align: 'center', width: 515 });
+  const footY = Math.max(noteY + 22, 755);
+  doc.moveTo(40, footY).lineTo(555, footY).lineWidth(0.5).stroke('#cbd5e1');
+  doc.font('Helvetica').fontSize(7.5).fillColor('#64748b');
+  doc.text('This is a computer-generated salary slip and does not require a physical signature.', 40, footY + 7, { align: 'center', width: 515 });
+  doc.fontSize(6.5).fillColor('#94a3b8')
+     .text(`Confidential • Issued by Worknai HRMS • Generated on ${new Date().toLocaleDateString('en-GB')}`, 40, footY + 18, { align: 'center', width: 515 });
 };
 
 /**

@@ -6,6 +6,9 @@ import { ApiResponse } from '../utils/ApiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Attendance } from '../models/Attendance.model.js';
 import { Payroll } from '../models/Payroll.model.js';
+import { Holiday } from '../models/Holiday.model.js';
+import mongoose from 'mongoose';
+import { processSingleEmployeePayroll } from './payroll.controller.js';
 
 // ── ROLE CONSTANTS ──
 const APPROVER_ROLES = ['SuperUser', 'HR', 'GM', 'VP', 'Director', 'Manager'];
@@ -40,16 +43,10 @@ function buildInitialApprovalState(applicantRole) {
   }
 }
 
-import { Holiday } from '../models/Holiday.model.js';
-import mongoose from 'mongoose';
-
 /**
  * Calculate total days between two dates, excluding Sundays and Holidays.
  */
 async function calcActualLeaveDays(start, end, halfDay) {
-  if (halfDay) return 0.5;
-  
-  let count = 0;
   let current = new Date(start);
   current.setHours(0, 0, 0, 0);
   const finish = new Date(end);
@@ -61,6 +58,15 @@ async function calcActualLeaveDays(start, end, halfDay) {
   });
   const holidayDates = new Set(holidays.map(h => h.date.toDateString()));
 
+  if (halfDay) {
+    const dayOfWeek = current.getDay();
+    const isSunday = dayOfWeek === 0;
+    const isHoliday = holidayDates.has(current.toDateString());
+    if (isSunday || isHoliday) return 0;
+    return 0.5;
+  }
+
+  let count = 0;
   while (current <= finish) {
     const dayOfWeek = current.getDay();
     const isSunday = dayOfWeek === 0;
@@ -72,10 +78,6 @@ async function calcActualLeaveDays(start, end, halfDay) {
     current.setDate(current.getDate() + 1);
   }
   return count;
-}
-
-function getNextApproverRole(currentRole, leave) {
-  return 'Completed';
 }
 
 /**
@@ -156,6 +158,68 @@ async function syncApprovedLeaveToAttendanceAndPayroll(leave, session = null) {
   }
 }
 
+/**
+ * Revert Attendance and Payroll records for a cancelled leave that was previously Approved.
+ */
+async function revertApprovedLeaveFromAttendanceAndPayroll(leave, session = null) {
+  try {
+    const empId = leave.employeeId._id || leave.employeeId;
+    const employee = await Employee.findById(empId);
+    if (!employee) return;
+
+    let current = new Date(leave.startDate);
+    const end = new Date(leave.endDate);
+
+    const startOfUTCDate = (date) => {
+      const d = new Date(date);
+      return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+    };
+
+    while (current <= end) {
+      const targetDate = startOfUTCDate(current);
+
+      const existing = await Attendance.findOne({
+        employeeCode: employee.employeeCode,
+        date: targetDate,
+      }).session(session);
+
+      if (existing) {
+        // If the attendance record was auto-created for the leave (no check-in / check-out times)
+        if (!existing.inTime && !existing.outTime && (existing.status === 'L' || existing.status === 'Coff')) {
+          await Attendance.deleteOne({ _id: existing._id }).session(session);
+        } else if (existing.status === 'L' || existing.status === 'Coff') {
+          // If there were actual check-in times recorded, revert status back to Present
+          existing.status = 'P';
+          await existing.save({ session });
+        }
+      }
+
+      current.setUTCDate(current.getUTCDate() + 1);
+    }
+
+    // Recalculate overlapping payroll records
+    const overlappingPayrolls = await Payroll.find({
+      employeeId: employee._id,
+      fromDate: { $lte: leave.endDate },
+      toDate: { $gte: leave.startDate },
+    }).session(session);
+
+    for (const pr of overlappingPayrolls) {
+      await processSingleEmployeePayroll({
+        employeeId: pr.employeeId,
+        fromDate: pr.fromDate,
+        toDate: pr.toDate,
+        targetMonth: pr.month,
+        targetYear: pr.year,
+        processedBy: empId,
+      });
+    }
+  } catch (err) {
+    console.error('Error in revertApprovedLeaveFromAttendanceAndPayroll:', err);
+    throw err;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // APPLY FOR LEAVE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,9 +290,10 @@ export const applyLeave = asyncHandler(async (req, res) => {
       if (newBalance < 0) throw new ApiError(400, 'Insufficient balance');
 
       leaveBalance[balanceField] = newBalance;
+      const historyLeaveType = isCompOffLeave ? 'CompOff' : 'Paid';
       leaveBalance.history.push({
         type: 'Deduction',
-        leaveType,
+        leaveType: historyLeaveType,
         amount: totalDays,
         previousBalance: prevBalance,
         newBalance,
@@ -316,6 +381,33 @@ export const getPendingLeaves = asyncHandler(async (req, res) => {
     query = { hrStatus: 'Pending', overallStatus: 'Pending' };
   } else {
     throw new ApiError(403, 'You do not have approval permissions');
+  }
+
+  if (req.query.page || req.query.limit) {
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (Number(page) - 1) * Number(limit);
+    const [leaves, total] = await Promise.all([
+      Leave.find(query)
+        .populate('employeeId', 'name employeeCode department role profileImageUrl')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit)),
+      Leave.countDocuments(query),
+    ]);
+
+    return res.json(
+      new ApiResponse(
+        200,
+        {
+          leaves,
+          total,
+          page: Number(page),
+          limit: Number(limit),
+          totalPages: Math.ceil(total / Number(limit)),
+        },
+        'Pending leaves fetched'
+      )
+    );
   }
 
   const leaves = await Leave.find(query)
@@ -423,21 +515,21 @@ export const approveLeave = asyncHandler(async (req, res) => {
   leave.currentApproverRole = 'Completed';
 
   // ── BALANCE ALREADY DEDUCTED DURING APPLICATION ──
-  // If Comp-Off, we still want to mark history entries as used (FIFO)
+  // If Comp-Off, mark history entries in LeaveBalance as used (FIFO)
   if (leave.leaveType === 'CompOff') {
-    const employee = await Employee.findById(leave.employeeId);
-    if (employee && employee.leaveBalanceHistory) {
+    const balanceDoc = await LeaveBalance.findOne({ employeeId: leave.employeeId });
+    if (balanceDoc && balanceDoc.history) {
       let daysToMark = leave.totalDays;
-      for (let i = 0; i < employee.leaveBalanceHistory.length; i++) {
-        const entry = employee.leaveBalanceHistory[i];
-        if (entry.leaveType === 'CompOff' && entry.type === 'Accrual' && !entry.isUsed) {
+      for (let i = 0; i < balanceDoc.history.length; i++) {
+        const entry = balanceDoc.history[i];
+        if (entry.leaveType === 'CompOff' && (entry.type === 'CompOffCredit' || entry.type === 'Addition') && !entry.isUsed) {
           entry.isUsed = true;
           entry.usedDate = new Date();
           daysToMark -= entry.amount;
           if (daysToMark <= 0) break;
         }
       }
-      await employee.save();
+      await balanceDoc.save();
     }
   }
 
@@ -504,9 +596,10 @@ export const rejectLeave = asyncHandler(async (req, res) => {
         const newBalance = prevBalance + leave.totalDays;
 
         balanceDoc[balanceField] = newBalance;
+        const historyLeaveType = isCompOffRefund ? 'CompOff' : 'Paid';
         balanceDoc.history.push({
           type: 'Adjustment',
-          leaveType: leave.leaveType,
+          leaveType: historyLeaveType,
           amount: leave.totalDays,
           previousBalance: prevBalance,
           newBalance: newBalance,
@@ -544,9 +637,11 @@ export const cancelLeave = asyncHandler(async (req, res) => {
 
   if (!isOwner && !isAdmin) throw new ApiError(403, 'You can only cancel your own leave');
 
-  if (leave.overallStatus !== 'Pending') {
+  if (!['Pending', 'Approved'].includes(leave.overallStatus)) {
     throw new ApiError(400, `Cannot cancel a leave that is already ${leave.overallStatus}`);
   }
+
+  const wasApproved = leave.overallStatus === 'Approved';
 
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -579,9 +674,10 @@ export const cancelLeave = asyncHandler(async (req, res) => {
         const newBalance = prevBalance + leave.totalDays;
 
         balanceDoc[balanceField] = newBalance;
+        const historyLeaveType = isCompOffCancel ? 'CompOff' : 'Paid';
         balanceDoc.history.push({
           type: 'Adjustment',
-          leaveType: leave.leaveType,
+          leaveType: historyLeaveType,
           amount: leave.totalDays,
           previousBalance: prevBalance,
           newBalance: newBalance,
@@ -595,7 +691,13 @@ export const cancelLeave = asyncHandler(async (req, res) => {
 
     await leave.save({ session });
     await session.commitTransaction();
-    res.json(new ApiResponse(200, leave, 'Leave cancelled and balance refunded'));
+
+    if (wasApproved) {
+      await revertApprovedLeaveFromAttendanceAndPayroll(leave);
+    }
+
+    const updated = await Leave.findById(leave._id).populate('employeeId', 'name employeeCode department role');
+    res.json(new ApiResponse(200, updated, 'Leave cancelled and balance refunded'));
   } catch (error) {
     await session.abortTransaction();
     throw error;
@@ -648,37 +750,28 @@ export const getLeaveStats = asyncHandler(async (req, res) => {
 // ─── MONTHLY LEAVE ACCRUAL & SETTLEMENT ──────────────────────────────────────
 
 export const accrueMonthlyLeaves = asyncHandler(async (req, res) => {
-  // Manual trigger for testing/debugging — callable by SuperUser/HR
-  await processMonthlyLeaveAccrual({ triggeredBy: 'manual-api' });
-  res.status(200).json(new ApiResponse(200, null, 'Monthly leave accrual completed successfully'));
+  res.status(200).json(new ApiResponse(200, null, 'Monthly leave accrual is disabled.'));
 });
 
 export const getLeaveBalanceHistory = asyncHandler(async (req, res) => {
-  const employee = await Employee.findById(req.user._id).select('leaveBalanceHistory');
-  if (!employee) throw new ApiError(404, 'Employee not found');
-
-  // Sort history by timestamp descending
-  const history = (employee.leaveBalanceHistory || []).sort((a, b) => b.timestamp - a.timestamp);
+  const balanceDoc = await LeaveBalance.findOne({ employeeId: req.user._id });
+  const history = (balanceDoc?.history || []).sort((a, b) => new Date(b.createdAt || b.timestamp) - new Date(a.createdAt || a.timestamp));
 
   res.json(new ApiResponse(200, history, 'Leave balance history fetched'));
 });
 
-
-
 //--- comp off screen -- view the compoffs
 
-
 export const getCompOffBalanceHistory = asyncHandler(async (req, res) => {
-  const employee = await Employee.findById(req.user._id).select('leaveBalanceHistory compOffBalance');
-  if (!employee) throw new ApiError(404, 'Employee not found');
-
+  const balanceDoc = await LeaveBalance.findOne({ employeeId: req.user._id });
+  const compOffBalance = balanceDoc?.compOffBalance || 0;
   const now = new Date();
 
-  const history = (employee.leaveBalanceHistory || [])
+  const history = (balanceDoc?.history || [])
     .filter((item) => item.leaveType === 'CompOff')
     .map((item) => {
       let status = 'Available';
-      if (item.type === 'Accrual') {
+      if (item.type === 'CompOffCredit' || item.type === 'Addition' || item.type === 'Accrual') {
         if (item.isUsed) status = 'Used';
         else if (item.expiryDate && new Date(item.expiryDate) < now) status = 'Expired';
       } else {
@@ -689,18 +782,18 @@ export const getCompOffBalanceHistory = asyncHandler(async (req, res) => {
         _id: item._id,
         type: item.type,
         amount: item.amount,
-        earnedDate: item.earnedDate || item.timestamp,
+        earnedDate: item.earnedDate || item.createdAt || item.timestamp,
         expiryDate: item.expiryDate,
         status: status,
         usedDate: item.usedDate,
         remarks: item.remarks,
-        timestamp: item.timestamp,
-        newBalance: item.newBalance
+        timestamp: item.createdAt || item.timestamp,
+        newBalance: item.newBalance,
       };
     })
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-  res.json(new ApiResponse(200, { history, currentBalance: employee.compOffBalance }, 'Comp-Off balance history fetched'));
+  res.json(new ApiResponse(200, { history, currentBalance: compOffBalance }, 'Comp-Off balance history fetched'));
 });
 
 /**
@@ -719,14 +812,16 @@ export const adjustLeaveBalance = asyncHandler(async (req, res) => {
   }
 
   const isPaidLeave = ['Paid', 'Casual', 'Sick', 'Earned'].includes(leaveType);
+  const isCompOff = leaveType === 'CompOff';
   const balanceField = isPaidLeave ? 'paidLeaveBalance' : 'compOffBalance';
   const prevBalance = balanceDoc[balanceField] || 0;
   const newBalance = Math.max(0, prevBalance + Number(amount));
 
   balanceDoc[balanceField] = newBalance;
+  const historyLeaveType = isCompOff ? 'CompOff' : 'Paid';
   balanceDoc.history.push({
     type: 'Adjustment',
-    leaveType,
+    leaveType: historyLeaveType,
     amount: Math.abs(Number(amount)),
     previousBalance: prevBalance,
     newBalance: newBalance,

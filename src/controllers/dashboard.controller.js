@@ -52,14 +52,14 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
     presentToday,
     lateCheckinsToday,
     wfhToday,
-    fieldToday,
+    officeToday,
     presentEmployees,
   ] = await Promise.all([
-    Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, status: { $in: ['P', 'AUTO', 'Coff'] } }),
+    Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, status: { $in: ['P', 'AUTO', 'Coff', 'Half'] } }),
     Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, isLate: true }),
-    Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, workMode: 'WFH', status: { $in: ['P', 'AUTO', 'Coff'] } }),
-    Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, workMode: 'Field', status: { $in: ['P', 'AUTO', 'Coff'] } }),
-    Attendance.find({ date: { $gte: today, $lte: todayEnd }, status: { $in: ['P', 'AUTO', 'Coff'] } })
+    Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, workMode: 'WFH', status: { $in: ['P', 'AUTO', 'Coff', 'Half'] } }),
+    Attendance.countDocuments({ date: { $gte: today, $lte: todayEnd }, workMode: 'Office', status: { $in: ['P', 'AUTO', 'Coff', 'Half'] } }),
+    Attendance.find({ date: { $gte: today, $lte: todayEnd }, status: { $in: ['P', 'AUTO', 'Coff', 'Half'] } })
       .populate('employeeId', 'name employeeCode profileImageUrl department')
       .sort({ inTime: -1 })
       .limit(10)
@@ -75,7 +75,7 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
   // 4. Pending Actions
   const [pendingLeaves, pendingCorrections] = await Promise.all([
     Leave.countDocuments({ overallStatus: 'Pending' }),
-    Attendance.countDocuments({ correctionRequested: true, correctionStatus: { $ne: 'Approved' } })
+    Attendance.countDocuments({ correctionRequested: true, correctionStatus: 'Pending' })
   ]);
 
   // 5. Gender Distribution
@@ -199,7 +199,7 @@ export const getHRDashboardStats = asyncHandler(async (req, res) => {
       absent: absentEmps.length,
       late: lateCheckinsToday,
       wfh: wfhToday,
-      field: fieldToday,
+      office: officeToday,
       presentEmployeesList: presentEmployees,
       absentEmployees: absentEmps.slice(0, 10)
     },

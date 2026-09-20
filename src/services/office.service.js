@@ -1,5 +1,7 @@
 import { Office } from '../models/Office.model.js';
 import { WorkingHours } from '../models/WorkingHours.model.js';
+import { calculateLateArrival, calculateEarlyCheckout } from './attendanceCalculation.service.js';
+import { parseOfficeTimeToday, DEFAULT_TIMEZONE } from '../utils/dateHelper.js';
 
 // ── In-memory cache for office settings ─────────────────────────────────────
 let _cachedOffice = null;
@@ -73,22 +75,24 @@ export const isWithinOffice = (latitude, longitude, office) => {
 };
 
 /**
- * Parse "HH:MM" string and return today's Date at that time (local).
+ * Parse "HH:MM" string and return today's Date at that time in office timezone.
  */
-export const parseTimeToday = (timeStr, referenceDate = new Date()) => {
-  const [hours, minutes] = timeStr.split(':').map(Number);
-  const d = new Date(referenceDate);
-  d.setHours(hours, minutes, 0, 0);
-  return d;
+export const parseTimeToday = (timeStr, referenceDate = new Date(), timezone = DEFAULT_TIMEZONE) => {
+  return parseOfficeTimeToday(timeStr, referenceDate, timezone);
 };
 
 /**
  * Calculate late minutes given working hours config and actual check-in time.
  */
-export const calcLateMinutes = (workingHours, checkInTime) => {
-  if (!workingHours?.checkInTime) return 0;
-  const expected = parseTimeToday(workingHours.checkInTime, checkInTime);
-  const grace = (workingHours.lateGraceMinutes || 0) * 60 * 1000;
-  const diff = checkInTime - expected - grace;
-  return diff > 0 ? Math.round(diff / 60000) : 0;
+export const calcLateMinutes = (workingHours, checkInTime, targetDate = new Date(), timezone = DEFAULT_TIMEZONE) => {
+  const { lateMinutes } = calculateLateArrival(checkInTime, workingHours, targetDate, timezone);
+  return lateMinutes;
+};
+
+/**
+ * Calculate early checkout minutes given working hours config and actual check-out time.
+ */
+export const calcEarlyCheckoutMinutes = (workingHours, checkOutTime, targetDate = new Date(), timezone = DEFAULT_TIMEZONE) => {
+  const { earlyCheckoutMinutes } = calculateEarlyCheckout(checkOutTime, workingHours, targetDate, timezone);
+  return earlyCheckoutMinutes;
 };

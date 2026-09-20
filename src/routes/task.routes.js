@@ -4,7 +4,6 @@ import { authorizeRoles } from '../middleware/role.middleware.js';
 import {
   createTask,
   getTodaySessionTasks,
-  getCarriedForwardTasks,
   getMyTasks,
   getTaskById,
   updateTask,
@@ -22,7 +21,6 @@ router.use(verifyJWT);
 // ── Employee routes ──
 router.post('/', createTask);
 router.get('/session/today', getTodaySessionTasks);
-router.get('/carried-forward', getCarriedForwardTasks);
 router.get('/my', getMyTasks);
 router.post('/sync-checkout', batchSyncSessionTasks);
 

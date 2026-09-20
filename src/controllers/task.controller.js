@@ -4,30 +4,25 @@ import { Employee } from '../models/Employee.model.js';
 import { ApiError } from '../utils/ApiError.js';
 import { ApiResponse } from '../utils/ApiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import {
+  getOfficeStartOfDay,
+  getOfficeEndOfDay,
+  DEFAULT_TIMEZONE,
+} from '../utils/dateHelper.js';
 
 const MANAGEMENT_ROLES = ['SuperUser', 'HR', 'Manager', 'Director', 'VP', 'GM'];
-
-const startOfDay = (d = new Date()) => {
-  const date = new Date(d);
-  date.setHours(0, 0, 0, 0);
-  return date;
-};
-
-const endOfDay = (d = new Date()) => {
-  const date = new Date(d);
-  date.setHours(23, 59, 59, 999);
-  return date;
-};
 
 // ─── CREATE TASK ─────────────────────────────────────────────────────────────
 
 export const createTask = asyncHandler(async (req, res) => {
   const {
     title,
-    description,
+    description = '',
     priority = 'Medium',
     dueTime,
-    notes,
+    notes = '',
+    employeeId: targetEmployeeId,
+    status = 'Assigned',
   } = req.body;
 
   if (!title || !title.trim()) {
@@ -35,58 +30,59 @@ export const createTask = asyncHandler(async (req, res) => {
   }
 
   const currentUser = req.user;
-  const today = startOfDay();
+  const isManager = MANAGEMENT_ROLES.includes(currentUser.role);
+
+  let targetEmployee = currentUser;
+  let isSelfAssigned = true;
+  let isAdminAssigned = false;
+
+  if (targetEmployeeId && targetEmployeeId.toString() !== currentUser._id.toString()) {
+    if (!isManager) {
+      throw new ApiError(403, 'Only managers and HR can assign tasks to other employees');
+    }
+    const foundEmp = await Employee.findById(targetEmployeeId);
+    if (!foundEmp) throw new ApiError(404, 'Assigned employee not found');
+    targetEmployee = foundEmp;
+    isSelfAssigned = false;
+    isAdminAssigned = true;
+  }
+
+  const today = getOfficeStartOfDay(new Date(), DEFAULT_TIMEZONE);
 
   // Find today's attendance record if checked in
   const attendance = await Attendance.findOne({
-    employeeId: currentUser._id,
+    employeeId: targetEmployee._id,
     date: today,
   });
 
   const task = await Task.create({
-    employeeId: currentUser._id,
-    employeeCode: currentUser.employeeCode,
-    employeeName: currentUser.name,
+    employeeId: targetEmployee._id,
+    employeeCode: targetEmployee.employeeCode,
+    employeeName: targetEmployee.name,
     attendanceId: attendance?._id || null,
     date: today,
     title: title.trim(),
-    description: description?.trim() || '',
-    priority,
-    status: 'Assigned',
-    dueTime: dueTime || null,
-    notes: notes?.trim() || '',
-    isSelfAssigned: true,
-    isAdminAssigned: false,
+    description: description.trim(),
+    priority: ['Low', 'Medium', 'High', 'Urgent'].includes(priority) ? priority : 'Medium',
+    status: ['Assigned', 'In Progress', 'Completed', 'Pending'].includes(status) ? status : 'Assigned',
+    dueTime: dueTime ? dueTime.trim() : undefined,
+    notes: notes.trim(),
+    isSelfAssigned,
+    isAdminAssigned,
     assignedBy: currentUser._id,
     assignedByName: currentUser.name,
+    completedAt: status === 'Completed' ? new Date() : null,
   });
 
   res.status(201).json(new ApiResponse(201, task, 'Task created successfully'));
-});
-
-// ─── GET CARRIED FORWARD TASKS (UNFINISHED FROM PREVIOUS DAYS) ─────────────
-
-export const getCarriedForwardTasks = asyncHandler(async (req, res) => {
-  const employeeId = req.user._id;
-  const todayStart = startOfDay();
-
-  const tasks = await Task.find({
-    employeeId,
-    status: { $in: ['Assigned', 'In Progress', 'Pending'] },
-    date: { $lt: todayStart },
-  }).sort({ date: -1 });
-
-  res.status(200).json(
-    new ApiResponse(200, tasks, 'Carried forward tasks fetched')
-  );
 });
 
 // ─── GET TODAY'S SESSION TASKS ───────────────────────────────────────────────
 
 export const getTodaySessionTasks = asyncHandler(async (req, res) => {
   const employeeId = req.user._id;
-  const todayStart = startOfDay();
-  const todayEnd = endOfDay();
+  const todayStart = getOfficeStartOfDay(new Date(), DEFAULT_TIMEZONE);
+  const todayEnd = getOfficeEndOfDay(new Date(), DEFAULT_TIMEZONE);
 
   const tasks = await Task.find({
     employeeId,
@@ -132,12 +128,12 @@ export const getMyTasks = asyncHandler(async (req, res) => {
   }
   if (from || to) {
     query.date = {};
-    if (from) query.date.$gte = startOfDay(new Date(from));
-    if (to) query.date.$lte = endOfDay(new Date(to));
+    if (from) query.date.$gte = getOfficeStartOfDay(new Date(from), DEFAULT_TIMEZONE);
+    if (to) query.date.$lte = getOfficeEndOfDay(new Date(to), DEFAULT_TIMEZONE);
   }
 
-  const pageNum = Math.max(1, parseInt(page));
-  const limitNum = Math.max(1, Math.min(100, parseInt(limit)));
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 20));
   const skip = (pageNum - 1) * limitNum;
 
   const [tasks, total] = await Promise.all([
@@ -175,7 +171,8 @@ export const getTaskById = asyncHandler(async (req, res) => {
 
   const task = await Task.findOne(filter)
     .populate('reviewedBy', 'name employeeCode')
-    .populate('assignedBy', 'name employeeCode');
+    .populate('assignedBy', 'name employeeCode')
+    .populate('employeeId', 'name employeeCode department');
 
   if (!task) throw new ApiError(404, 'Task not found');
 
@@ -232,14 +229,32 @@ export const deleteTask = asyncHandler(async (req, res) => {
 export const batchSyncSessionTasks = asyncHandler(async (req, res) => {
   const { tasks = [] } = req.body;
   const employeeId = req.user._id;
+  const todayStart = getOfficeStartOfDay(new Date(), DEFAULT_TIMEZONE);
+  const todayEnd = getOfficeEndOfDay(new Date(), DEFAULT_TIMEZONE);
+
+  // Find today's attendance record
+  const attendance = await Attendance.findOne({
+    employeeId,
+    date: { $gte: todayStart, $lte: todayEnd },
+  });
 
   if (Array.isArray(tasks) && tasks.length > 0) {
-    const validTasks = tasks.filter((t) => t && t._id && typeof t._id === 'string' && t._id.length === 24);
+    const validTasks = tasks.filter((t) => t && t._id);
     if (validTasks.length > 0) {
       const updateOps = validTasks.map((t) => {
-        const updateFields = { status: t.status };
-        if (t.status === 'Completed') {
-          updateFields.completedAt = new Date();
+        const isCompleted = t.status === 'Completed';
+        const updateFields = {
+          status: isCompleted ? 'Completed' : 'Pending',
+          completedAt: isCompleted ? new Date() : null,
+        };
+        if (t.description !== undefined) {
+          updateFields.description = String(t.description).trim();
+        }
+        if (t.notes !== undefined) {
+          updateFields.notes = String(t.notes).trim();
+        }
+        if (attendance?._id) {
+          updateFields.attendanceId = attendance._id;
         }
         return {
           updateOne: {
@@ -254,9 +269,6 @@ export const batchSyncSessionTasks = asyncHandler(async (req, res) => {
   }
 
   // Refetch updated tasks for today
-  const todayStart = startOfDay();
-  const todayEnd = endOfDay();
-
   const sessionTasks = await Task.find({
     employeeId,
     date: { $gte: todayStart, $lte: todayEnd },
@@ -265,7 +277,9 @@ export const batchSyncSessionTasks = asyncHandler(async (req, res) => {
   const completedList = sessionTasks.filter((t) => t.status === 'Completed');
   const pendingList = sessionTasks.filter((t) => t.status !== 'Completed');
 
-  const summaryText = completedList.map((t, idx) => `${idx + 1}. ${t.title}`).join('\n');
+  const summaryText = completedList
+    .map((t, idx) => `${idx + 1}. ${t.title}${t.description ? ` (${t.description})` : ''}`)
+    .join('\n');
   const pendingText = pendingList.map((t, idx) => `${idx + 1}. ${t.title}`).join('\n');
 
   res.status(200).json(
@@ -286,21 +300,41 @@ export const batchSyncSessionTasks = asyncHandler(async (req, res) => {
 // ─── ADMIN: GET ALL EMPLOYEE TASKS ───────────────────────────────────────────
 
 export const getAdminTaskList = asyncHandler(async (req, res) => {
-  const { employeeCode, department, status, priority, from, to, reviewStatus, page = 1, limit = 25 } = req.query;
+  const {
+    employeeCode,
+    search,
+    department,
+    status,
+    priority,
+    from,
+    to,
+    reviewStatus,
+    page = 1,
+    limit = 25,
+  } = req.query;
 
   const query = {};
 
-  if (status && status !== 'all') query.status = status;
+  if (status && status !== 'all') {
+    if (status === 'Pending') {
+      query.status = { $in: ['Pending', 'Assigned', 'In Progress'] };
+    } else {
+      query.status = status;
+    }
+  }
   if (priority && priority !== 'all') query.priority = priority;
   if (reviewStatus && reviewStatus !== 'all') query.reviewStatus = reviewStatus;
 
   if (from || to) {
     query.date = {};
-    if (from) query.date.$gte = startOfDay(new Date(from));
-    if (to) query.date.$lte = endOfDay(new Date(to));
+    if (from) query.date.$gte = getOfficeStartOfDay(new Date(from), DEFAULT_TIMEZONE);
+    if (to) query.date.$lte = getOfficeEndOfDay(new Date(to), DEFAULT_TIMEZONE);
   } else {
-    // Default to today if no date range specified
-    query.date = { $gte: startOfDay(), $lte: endOfDay() };
+    // Default to today
+    query.date = {
+      $gte: getOfficeStartOfDay(new Date(), DEFAULT_TIMEZONE),
+      $lte: getOfficeEndOfDay(new Date(), DEFAULT_TIMEZONE),
+    };
   }
 
   // Filter by department via employee lookup
@@ -309,29 +343,42 @@ export const getAdminTaskList = asyncHandler(async (req, res) => {
     query.employeeId = { $in: emps.map((e) => e._id) };
   }
 
-  if (employeeCode) {
-    query.employeeCode = { $regex: employeeCode, $options: 'i' };
+  const searchTerm = search || employeeCode;
+  if (searchTerm) {
+    query.$or = [
+      { employeeCode: { $regex: searchTerm, $options: 'i' } },
+      { employeeName: { $regex: searchTerm, $options: 'i' } },
+      { title: { $regex: searchTerm, $options: 'i' } },
+    ];
   }
 
-  const pageNum = Math.max(1, parseInt(page));
-  const limitNum = Math.max(1, Math.min(100, parseInt(limit)));
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 25));
   const skip = (pageNum - 1) * limitNum;
 
-  const [tasks, total] = await Promise.all([
+  const [tasks, total, allFiltered] = await Promise.all([
     Task.find(query)
       .sort({ date: -1, createdAt: -1 })
       .skip(skip)
       .limit(limitNum)
       .populate('reviewedBy', 'name employeeCode')
+      .populate('attendanceId', 'inTime outTime totalHours totalMinutes workMode status isLate lateMinutes isEarlyCheckout earlyCheckoutMinutes')
+      .populate('employeeId', 'name employeeCode department profileImageUrl')
       .lean(),
     Task.countDocuments(query),
+    Task.find(query, { status: 1, reviewStatus: 1 }).lean(),
   ]);
+
+  const completed = allFiltered.filter((t) => t.status === 'Completed').length;
+  const pending = allFiltered.filter((t) => t.status !== 'Completed').length;
+  const reviewed = allFiltered.filter((t) => t.reviewStatus === 'Reviewed').length;
 
   const summary = {
     total,
-    completed: tasks.filter((t) => t.status === 'Completed').length,
-    pending: tasks.filter((t) => t.status !== 'Completed').length,
-    reviewed: tasks.filter((t) => t.reviewStatus === 'Reviewed').length,
+    completed,
+    pending,
+    reviewed,
+    completionPercentage: total > 0 ? Math.round((completed / total) * 100) : 0,
   };
 
   res.status(200).json(

@@ -29,9 +29,16 @@ const attendanceSchema = new mongoose.Schema(
       default: 'P',
     },
 
-    // ── LATE INFO ──
+    // ── LATE & EARLY INFO ──
     isLate: { type: Boolean, default: false },
     lateMinutes: { type: Number, default: 0 },
+    isEarlyCheckout: { type: Boolean, default: false },
+    earlyCheckoutMinutes: { type: Number, default: 0 },
+
+    // ── OVERTIME & SHORTFALL ──
+    overtimeMinutes: { type: Number, default: 0 },
+    shortfallMinutes: { type: Number, default: 0 },
+    compOffDaysCredited: { type: Number, default: 0 },
 
     // ── GEO ATTENDANCE ──
     isGeoAttendance: { type: Boolean, default: false },
@@ -40,10 +47,10 @@ const attendanceSchema = new mongoose.Schema(
     checkOutLatitude: { type: Number },
     checkOutLongitude: { type: Number },
 
-    // ── FIELD/WFH ENHANCEMENTS ──
+    // ── WORK MODE (Office / WFH) ──
     workMode: {
       type: String,
-      enum: ['Office', 'Field', 'WFH'],
+      enum: ['Office', 'WFH'],
       default: 'Office',
     },
     locationHistory: [

@@ -2,12 +2,12 @@ import { Router } from 'express';
 import {
   checkIn,
   checkOut,
-  trackLocation,
   getTodayStatus,
   getMySummary,
   getAttendanceList,
   markReportAsRead,
   requestCorrection,
+  editCorrection,
   approveCorrection,
   getPendingCorrections,
   getMyCorrectionHistory,
@@ -23,7 +23,6 @@ router.use(verifyJWT);
 // ── EMPLOYEE SELF-SERVICE ──
 router.post('/check-in', checkIn);
 router.post('/check-out', checkOut);
-router.post('/track', trackLocation);
 router.get('/today', getTodayStatus);
 router.get('/my-summary', getMySummary);
 router.get('/my-corrections', getMyCorrectionHistory);
@@ -32,6 +31,7 @@ router.get('/correction-history', getMyCorrectionHistory);
 // ── CORRECTION ──
 router.post('/correction', requestCorrection);
 router.post('/correction/:id', requestCorrection);
+router.put('/correction/:id', editCorrection);
 router.get('/corrections/pending', requireRole([...MANAGEMENT_ROLES, 'Manager']), getPendingCorrections);
 router.patch('/correction/:id', requireRole([...MANAGEMENT_ROLES, 'Manager']), approveCorrection);
 

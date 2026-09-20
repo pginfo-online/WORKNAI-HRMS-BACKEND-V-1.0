@@ -59,6 +59,13 @@ const officeSchema = new mongoose.Schema(
       default: [],
     },
 
+    // Office timezone (default: Asia/Kolkata for IST)
+    timezone: {
+      type: String,
+      default: 'Asia/Kolkata',
+      trim: true,
+    },
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Employee',

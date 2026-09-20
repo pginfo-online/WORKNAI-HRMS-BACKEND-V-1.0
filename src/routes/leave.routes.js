@@ -9,7 +9,6 @@ import {
   rejectLeave,
   cancelLeave,
   getLeaveStats,
-  accrueMonthlyLeaves,
   getLeaveBalanceHistory,
   getCompOffBalanceHistory,
   adjustLeaveBalance,
@@ -43,12 +42,18 @@ router.get(
 
 // ── ALL LEAVES (admin view) ──
 router.get(
+  '/',
+  authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director'),
+  getAllLeaves
+);
+router.get(
   '/all',
   authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director'),
   getAllLeaves
 );
 
 // ── APPLY FOR LEAVE ──
+router.post('/', applyLeave);
 router.post('/apply', applyLeave);
 
 // ── LEAVE BY ID ──
@@ -71,8 +76,7 @@ router.patch(
 // ── CANCEL (owner or admin) ──
 router.patch('/:id/cancel', cancelLeave);
 
-// ── ACCRUAL & ADJUSTMENT (Admin/HR only) ──
-router.post('/accrue-monthly', authorizeRoles('SuperUser', 'HR', 'GM', 'VP', 'Director'), accrueMonthlyLeaves);
+// ── ADJUSTMENT (Admin/HR only) ──
 router.post('/adjust-balance', authorizeRoles('SuperUser', 'HR'), adjustLeaveBalance);
 
 export default router;

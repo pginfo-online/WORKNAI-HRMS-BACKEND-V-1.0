@@ -41,22 +41,29 @@ const workingHoursSchema = new mongoose.Schema(
       min: 0,
     },
 
-    // Minimum minutes of work to count as a half-day
+    // Grace period before marking early checkout (minutes before checkOutTime)
+    earlyCheckoutGraceMinutes: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    // Minimum minutes of work to count as a half-day (4.5 hours)
     halfDayMinutes: {
       type: Number,
-      default: 240, // 4 hours
+      default: 270,
     },
 
-    // Minimum minutes of work to count as a full day
+    // Minimum minutes of work to count as a full day (9 working hours)
     fullDayMinutes: {
       type: Number,
-      default: 480, // 8 hours
+      default: 540,
     },
 
-    // Work days: 0=Sunday, 1=Monday … 6=Saturday
+    // Work days: 0=Sunday, 1=Monday … 6=Saturday (Sunday is weekly holiday)
     workDays: {
       type: [Number],
-      default: [1, 2, 3, 4, 5], // Mon–Fri
+      default: [1, 2, 3, 4, 5, 6], // Mon–Sat, Sunday is weekly off
       validate: {
         validator: (arr) => arr.every((d) => d >= 0 && d <= 6),
         message: 'workDays must be 0–6',

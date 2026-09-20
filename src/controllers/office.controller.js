@@ -26,7 +26,7 @@ export const getActiveOfficeSettings = asyncHandler(async (req, res) => {
 });
 
 export const createOffice = asyncHandler(async (req, res) => {
-  const { name, address, city, state, latitude, longitude, radiusMeters, geoBypassCodes } = req.body;
+  const { name, address, city, state, latitude, longitude, radiusMeters, geoBypassCodes, timezone } = req.body;
 
   if (!name || latitude == null || longitude == null) {
     throw new ApiError(400, 'name, latitude, and longitude are required');
@@ -41,6 +41,7 @@ export const createOffice = asyncHandler(async (req, res) => {
     longitude: parseFloat(longitude),
     radiusMeters: radiusMeters ? parseInt(radiusMeters) : 200,
     geoBypassCodes: geoBypassCodes || [],
+    timezone: timezone || 'Asia/Kolkata',
     createdBy: req.user._id,
   });
 
@@ -50,7 +51,7 @@ export const createOffice = asyncHandler(async (req, res) => {
 
 export const updateOffice = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { name, address, city, state, latitude, longitude, radiusMeters, workingHoursId, isActive, geoBypassCodes } = req.body;
+  const { name, address, city, state, latitude, longitude, radiusMeters, workingHoursId, isActive, geoBypassCodes, timezone } = req.body;
 
   const office = await Office.findById(id);
   if (!office) throw new ApiError(404, 'Office not found');
@@ -65,6 +66,7 @@ export const updateOffice = asyncHandler(async (req, res) => {
   if (workingHoursId) office.workingHoursId = workingHoursId;
   if (isActive !== undefined) office.isActive = isActive;
   if (geoBypassCodes) office.geoBypassCodes = geoBypassCodes;
+  if (timezone) office.timezone = timezone;
 
   await office.save();
   invalidateOfficeCache();
@@ -92,7 +94,18 @@ export const listWorkingHours = asyncHandler(async (req, res) => {
 });
 
 export const createWorkingHours = asyncHandler(async (req, res) => {
-  const { officeId, name, checkInTime, checkOutTime, lateGraceMinutes, halfDayMinutes, fullDayMinutes, workDays, isDefault } = req.body;
+  const {
+    officeId,
+    name,
+    checkInTime,
+    checkOutTime,
+    lateGraceMinutes,
+    earlyCheckoutGraceMinutes,
+    halfDayMinutes,
+    fullDayMinutes,
+    workDays,
+    isDefault,
+  } = req.body;
 
   if (!officeId || !checkInTime || !checkOutTime) {
     throw new ApiError(400, 'officeId, checkInTime, and checkOutTime are required');
@@ -111,10 +124,11 @@ export const createWorkingHours = asyncHandler(async (req, res) => {
     name: name || 'Standard Shift',
     checkInTime,
     checkOutTime,
-    lateGraceMinutes: lateGraceMinutes ?? 0,
-    halfDayMinutes: halfDayMinutes ?? 240,
-    fullDayMinutes: fullDayMinutes ?? 480,
-    workDays: workDays ?? [1, 2, 3, 4, 5],
+    lateGraceMinutes: lateGraceMinutes != null ? parseInt(lateGraceMinutes) : 0,
+    earlyCheckoutGraceMinutes: earlyCheckoutGraceMinutes != null ? parseInt(earlyCheckoutGraceMinutes) : 0,
+    halfDayMinutes: halfDayMinutes ? parseInt(halfDayMinutes) : 270,
+    fullDayMinutes: fullDayMinutes ? parseInt(fullDayMinutes) : 540,
+    workDays: workDays ?? [1, 2, 3, 4, 5, 6],
     isDefault: isDefault ?? false,
     createdBy: req.user._id,
   });
@@ -134,7 +148,16 @@ export const updateWorkingHours = asyncHandler(async (req, res) => {
   const wh = await WorkingHours.findById(id);
   if (!wh) throw new ApiError(404, 'Working hours not found');
 
-  const fields = ['name', 'checkInTime', 'checkOutTime', 'lateGraceMinutes', 'halfDayMinutes', 'fullDayMinutes', 'workDays'];
+  const fields = [
+    'name',
+    'checkInTime',
+    'checkOutTime',
+    'lateGraceMinutes',
+    'earlyCheckoutGraceMinutes',
+    'halfDayMinutes',
+    'fullDayMinutes',
+    'workDays',
+  ];
   fields.forEach((f) => {
     if (req.body[f] !== undefined) wh[f] = req.body[f];
   });

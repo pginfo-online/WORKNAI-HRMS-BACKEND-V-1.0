@@ -3,6 +3,8 @@ import {
   generatePayroll, 
   generateAllPayroll,
   getPayrollList, 
+  getPayrollById,
+  updatePayrollStatus,
   getSalarySlip,
   getPayrollSettings,
   savePayrollSettings
@@ -21,12 +23,14 @@ router.post('/settings', authorizeRoles(...ADMIN_ROLES), savePayrollSettings);
 
 // ── ADMIN / HR ONLY ──
 router.post('/generate-all', authorizeRoles(...MANAGEMENT_ROLES), generateAllPayroll);
+router.patch('/:id/status', authorizeRoles(...MANAGEMENT_ROLES), updatePayrollStatus);
 
 // ── ALL ROLES (With Internal Auth Checks) ──
 router.post('/generate', authorizeRoles(...ALL_ROLES), generatePayroll);
 router.get('/list', authorizeRoles(...ALL_ROLES), getPayrollList);
 
-// ── INDIVIDUAL SALARY SLIP ACCESS ──
+// ── INDIVIDUAL SALARY SLIP & RECORD ACCESS ──
 router.get('/salary-slip/:id', getSalarySlip);
+router.get('/:id', getPayrollById);
 
 export default router;
